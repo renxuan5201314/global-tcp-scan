@@ -18,7 +18,8 @@ usability or whether an IP is residential.</p>
 <li><a href="sg.txt">SG — Singapore TXT</a> (<a href="data/sg.json">JSON details</a>)</li>
 <li><a href="de.txt">DE — Germany TXT</a> (<a href="data/de.json">JSON details</a>)</li>
 </ul>
-<p>Each scheduled run scans one region and up to the configured batch size.
-Previous successful measurements are retained when retests fail.</p>
+<p>All configured regions are processed sequentially. Previous successful
+measurements are retained when retests fail. A new round starts at least
+30 minutes after the previous round completes.</p>
 </body>
 </html>
