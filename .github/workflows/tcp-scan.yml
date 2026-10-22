@@ -3,6 +3,8 @@ name: Global TCP scan and publish TXT
 
 on:
   schedule:
+    # GitHub wakes the workflow every 5 minutes.
+    # scanner.py decides whether the 30-minute interval has elapsed.
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
@@ -18,7 +20,11 @@ concurrency:
 jobs:
   scan-and-publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 30
+
+    outputs:
+      publish: ${{ steps.scan.outputs.publish }}
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -34,7 +40,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Scan one region and update TXT files
+      - name: Scan all regions sequentially
+        id: scan
         env:
           SOURCE_URL: https://proxy.seeck.cn/api/nodes?region=
           REGIONS: JP,HK,KR,CN,US,SG,DE
@@ -43,11 +50,12 @@ jobs:
           MAX_CONCURRENCY: "5"
         run: python scanner.py
 
-      - name: Commit updated results
+      - name: Commit updated results and scan state
+        if: steps.scan.outputs.publish == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add public
+          git add public .scan-state.json
           if git diff --cached --quiet; then
             echo "No result changes to commit."
           else
@@ -56,13 +64,16 @@ jobs:
           fi
 
       - name: Configure GitHub Pages
+        if: steps.scan.outputs.publish == 'true'
         uses: actions/configure-pages@v5
 
       - name: Upload Pages artifact
+        if: steps.scan.outputs.publish == 'true'
         uses: actions/upload-pages-artifact@v3
         with:
           path: public
 
       - name: Deploy to GitHub Pages
+        if: steps.scan.outputs.publish == 'true'
         id: deployment
         uses: actions/deploy-pages@v4
