@@ -44,11 +44,14 @@ def slot_number():
 
 
 def fetch_json(url):
-    """Fetch JSON and provide useful diagnostics if the source is invalid."""
+    """
+    Fetch either JSON or plain-text node lists.
+    The function name is retained to avoid changing the rest of the program.
+    """
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "github-actions-global-tcp-scan/1.1",
+            "User-Agent": "github-actions-global-tcp-scan/1.2",
             "Accept": "application/json, text/plain, */*",
         },
     )
@@ -78,24 +81,47 @@ def fetch_json(url):
 
     if not text:
         raise ValueError(
-            f"Source returned empty response: HTTP {status}; "
-            f"Content-Type={content_type}; bytes={len(raw)}; URL={final_url}"
+            f"Source returned an empty response: HTTP {status}; "
+            f"Content-Type={content_type}; bytes={len(raw)}"
         )
 
+    # Prefer JSON when the entire response is valid JSON.
     try:
         payload = json.loads(text)
-    except json.JSONDecodeError as exc:
-        sample = " ".join(text[:500].split())
-        raise ValueError(
-            f"Source returned invalid JSON: HTTP {status}; "
-            f"Content-Type={content_type}; bytes={len(raw)}; "
-            f"URL={final_url}; JSON error={exc}; "
-            f"bodySample={sample!r}"
-        ) from exc
+        response_format = "JSON"
+    except json.JSONDecodeError:
+        # The configured API currently returns lines such as:
+        # 172.105.121.230:443#SG
+        # 146.190.87.188:443#SG
+        #
+        # Accept plain text only when it contains endpoint-like lines.
+        lines = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+        endpoint_lines = [
+            line for line in lines
+            if parse_endpoint(line) is not None
+        ]
+
+        if not endpoint_lines:
+            sample = " ".join(text[:500].split())
+            raise ValueError(
+                f"Source is neither valid JSON nor a recognized IP:port list. "
+                f"HTTP {status}; Content-Type={content_type}; "
+                f"bytes={len(raw)}; URL={final_url}; "
+                f"bodySample={sample!r}"
+            )
+
+        payload = endpoint_lines
+        response_format = "plain text"
 
     print(
-        f"Source response: HTTP {status}; Content-Type={content_type}; "
-        f"bytes={len(raw)}; URL={final_url}"
+        f"Source response: HTTP {status}; "
+        f"Content-Type={content_type}; bytes={len(raw)}; "
+        f"format={response_format}; URL={final_url}"
     )
     return payload, len(raw)
 
@@ -105,7 +131,14 @@ def parse_endpoint(item):
     port = None
 
     if isinstance(item, str):
-        value = item.strip().split("#", 1)[0].strip()
+        # Remove comments such as #SG or #JP-01-25ms.
+        value = item.strip()
+        if not value:
+            return None
+
+        # Accept whitespace-delimited lines containing multiple endpoints.
+        # Normal single-endpoint lines are handled below.
+        value = value.split("#", 1)[0].strip()
 
         if value.startswith("[") and "]:" in value:
             ip, port = value[1:].split("]:", 1)
@@ -165,7 +198,6 @@ def candidates_from(payload):
                 raw = payload[key]
                 break
 
-        # Also support structures such as {"data": {"nodes": [...]}}.
         if raw is None:
             for parent_key in ("data", "result", "response"):
                 parent = payload.get(parent_key)
@@ -194,7 +226,7 @@ def candidates_from(payload):
 
     else:
         raise ValueError(
-            f"API JSON root must be a list or object, "
+            f"API response must be a list or object, "
             f"not {type(payload).__name__}"
         )
 
@@ -212,8 +244,7 @@ def candidates_from(payload):
         sample = repr(raw[:3])[:600] if isinstance(raw, list) else repr(raw)[:600]
         raise ValueError(
             "No valid IP:port candidates parsed. "
-            f"List length={len(raw) if isinstance(raw, list) else 'unknown'}; "
-            f"sample={sample}. The API may use another data format."
+            f"Sample={sample}. Check the source format."
         )
 
     return nodes
@@ -321,7 +352,6 @@ def main():
     round_no = slot // len(REGIONS)
 
     source_url = SOURCE_URL + region
-
     print(f"Starting region={region}")
     print(f"Source URL={source_url}")
 
@@ -330,7 +360,6 @@ def main():
 
     start = (round_no * BATCH_SIZE) % len(candidates)
     count = min(BATCH_SIZE, len(candidates))
-
     batch = [
         candidates[(start + i) % len(candidates)]
         for i in range(count)
@@ -354,8 +383,7 @@ def main():
         f"failed={failed_count}"
     )
 
-    # Retain successful cached measurements outside this batch.
-    # A failed retest will not erase a previously successful measurement.
+    # Retain previous successful records. Failed retests do not erase them.
     merged = {}
 
     for node in read_previous(region):
@@ -400,10 +428,7 @@ def main():
         ),
     )[:500]
 
-    # Preserve the existing TXT format:
-    # IP:PORT#REGION-NN-Nms
     lines = []
-
     for index, node in enumerate(nodes, 1):
         ms = max(0, round(float(node["latencyMs"])))
         lines.append(
