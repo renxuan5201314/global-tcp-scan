@@ -1,87 +1,454 @@
+
 #!/usr/bin/env python3
-"""Scan one region per run, then update public/<region>.txt and public/data/<region>.json."""
-import concurrent.futures, datetime as dt, ipaddress, json, os, socket, sys, time, urllib.request
+# -*- coding: utf-8 -*-
+
+"""Scan regional IP:port candidates and publish TCP latency results."""
+
+import concurrent.futures
+import datetime as dt
+import ipaddress
+import json
+import os
+import socket
+import sys
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
-REGIONS=[x.strip().upper() for x in os.getenv('REGIONS','JP,HK,KR,CN,US,SG,DE').split(',') if x.strip()]
-SOURCE_URL=os.getenv('SOURCE_URL','https://proxy.seeck.cn/api/nodes?region=')
-BATCH_SIZE=max(1,min(int(os.getenv('BATCH_SIZE','25')),100))
-TIMEOUT=max(1.0,min(float(os.getenv('CONNECT_TIMEOUT_SECONDS','5')),10.0))
-CONCURRENCY=max(1,min(int(os.getenv('MAX_CONCURRENCY','5')),10))
-OUT=Path('public'); DATA=OUT/'data'
-def now(): return dt.datetime.now(dt.timezone.utc)
-def slot_number(): return int(now().timestamp()//300)
+
+REGIONS = [
+    x.strip().upper()
+    for x in os.getenv("REGIONS", "JP,HK,KR,CN,US,SG,DE").split(",")
+    if x.strip()
+]
+SOURCE_URL = os.getenv(
+    "SOURCE_URL",
+    "https://proxy.seeck.cn/api/nodes?region=",
+)
+BATCH_SIZE = max(1, min(int(os.getenv("BATCH_SIZE", "25")), 100))
+TIMEOUT = max(
+    1.0, min(float(os.getenv("CONNECT_TIMEOUT_SECONDS", "5")), 10.0)
+)
+CONCURRENCY = max(1, min(int(os.getenv("MAX_CONCURRENCY", "5")), 10))
+
+OUT = Path("public")
+DATA = OUT / "data"
+
+
+def now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def slot_number():
+    return int(now().timestamp() // 300)
+
+
 def fetch_json(url):
- req=urllib.request.Request(url,headers={'User-Agent':'github-actions-global-tcp-scan/1.0'})
- with urllib.request.urlopen(req,timeout=20) as r:
-  raw=r.read(); return json.loads(raw.decode('utf-8',errors='replace')),len(raw)
+    """Fetch JSON and provide useful diagnostics if the source is invalid."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "github-actions-global-tcp-scan/1.1",
+            "Accept": "application/json, text/plain, */*",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            raw = response.read()
+            status = response.status
+            content_type = response.headers.get("Content-Type", "unknown")
+            final_url = response.geturl()
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read(1000).decode("utf-8-sig", errors="replace")
+            sample = " ".join(body.split())[:500]
+        except Exception:
+            sample = "(unable to read response)"
+        raise RuntimeError(
+            f"Source HTTP error: status={exc.code}; "
+            f"reason={str(exc.reason)[:200]}; bodySample={sample!r}"
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(
+            f"Source request failed: {type(exc).__name__}: {str(exc)[:300]}"
+        ) from exc
+
+    text = raw.decode("utf-8-sig", errors="replace").strip()
+
+    if not text:
+        raise ValueError(
+            f"Source returned empty response: HTTP {status}; "
+            f"Content-Type={content_type}; bytes={len(raw)}; URL={final_url}"
+        )
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        sample = " ".join(text[:500].split())
+        raise ValueError(
+            f"Source returned invalid JSON: HTTP {status}; "
+            f"Content-Type={content_type}; bytes={len(raw)}; "
+            f"URL={final_url}; JSON error={exc}; "
+            f"bodySample={sample!r}"
+        ) from exc
+
+    print(
+        f"Source response: HTTP {status}; Content-Type={content_type}; "
+        f"bytes={len(raw)}; URL={final_url}"
+    )
+    return payload, len(raw)
+
+
 def parse_endpoint(item):
- ip=port=None
- if isinstance(item,str):
-  x=item.strip().split('#',1)[0]
-  if x.startswith('[') and ']:' in x: ip,port=x[1:].split(']:',1)
-  elif x.count(':')==1: ip,port=x.rsplit(':',1)
- elif isinstance(item,dict):
-  ip=item.get('ip') or item.get('host') or item.get('address'); port=item.get('port')
-  if ip and port is None and isinstance(ip,str) and ip.count(':')==1: ip,port=ip.rsplit(':',1)
- if not ip or port is None:return None
- try:
-  ip=str(ipaddress.ip_address(str(ip).strip())); port=int(port)
-  if not 1<=port<=65535:return None
-  return {'ip':ip,'port':port,'address':f'{ip}:{port}'}
- except (ValueError,TypeError):return None
+    ip = None
+    port = None
+
+    if isinstance(item, str):
+        value = item.strip().split("#", 1)[0].strip()
+
+        if value.startswith("[") and "]:" in value:
+            ip, port = value[1:].split("]:", 1)
+        elif value.count(":") == 1:
+            ip, port = value.rsplit(":", 1)
+
+    elif isinstance(item, dict):
+        ip = (
+            item.get("ip")
+            or item.get("host")
+            or item.get("address")
+            or item.get("server")
+        )
+        port = item.get("port")
+
+        if (
+            ip
+            and port is None
+            and isinstance(ip, str)
+            and ip.count(":") == 1
+        ):
+            ip, port = ip.rsplit(":", 1)
+
+    if not ip or port is None:
+        return None
+
+    try:
+        ip = str(ipaddress.ip_address(str(ip).strip()))
+        port = int(port)
+
+        if not 1 <= port <= 65535:
+            return None
+
+        return {
+            "ip": ip,
+            "port": port,
+            "address": f"{ip}:{port}",
+        }
+    except (ValueError, TypeError):
+        return None
+
+
 def candidates_from(payload):
- if isinstance(payload,list): raw=payload
- elif isinstance(payload,dict):
-  raw=next((payload[k] for k in ('nodes','data','list','results','items','proxies') if isinstance(payload.get(k),list)),None)
-  if raw is None: raw=next((v for v in payload.values() if isinstance(v,list)),None)
-  if raw is None: raise ValueError('API JSON does not contain a recognizable node list')
- else: raise ValueError('API JSON is not a list/object')
- out=[]; seen=set()
- for item in raw:
-  n=parse_endpoint(item)
-  if n and n['address'] not in seen: seen.add(n['address']); out.append(n)
- if not out: raise ValueError('No valid IP:port candidates parsed; inspect source API JSON format')
- return out
-def test_tcp(n):
- started=time.perf_counter(); result={**n,'ok':False,'latencyMs':None,'testedAt':now().isoformat().replace('+00:00','Z'),'error':None}
- try:
-  with socket.create_connection((n['ip'],n['port']),timeout=TIMEOUT):
-   result['ok']=True; result['latencyMs']=round((time.perf_counter()-started)*1000,2)
- except socket.timeout: result['error']=f'TCP timeout after {TIMEOUT:g}s'
- except OSError as e: result['error']=f'{type(e).__name__}: {str(e)[:160]}'
- return result
+    if isinstance(payload, list):
+        raw = payload
+
+    elif isinstance(payload, dict):
+        raw = None
+
+        keys = (
+            "nodes", "data", "list", "results", "items",
+            "proxies", "servers", "ips",
+        )
+
+        for key in keys:
+            if isinstance(payload.get(key), list):
+                raw = payload[key]
+                break
+
+        # Also support structures such as {"data": {"nodes": [...]}}.
+        if raw is None:
+            for parent_key in ("data", "result", "response"):
+                parent = payload.get(parent_key)
+
+                if isinstance(parent, dict):
+                    for key in keys:
+                        if isinstance(parent.get(key), list):
+                            raw = parent[key]
+                            break
+
+                if raw is not None:
+                    break
+
+        if raw is None:
+            raw = next(
+                (value for value in payload.values()
+                 if isinstance(value, list)),
+                None,
+            )
+
+        if raw is None:
+            raise ValueError(
+                "API JSON has no recognizable node list. "
+                f"Top-level keys: {list(payload.keys())[:30]}"
+            )
+
+    else:
+        raise ValueError(
+            f"API JSON root must be a list or object, "
+            f"not {type(payload).__name__}"
+        )
+
+    nodes = []
+    seen = set()
+
+    for item in raw:
+        node = parse_endpoint(item)
+
+        if node and node["address"] not in seen:
+            seen.add(node["address"])
+            nodes.append(node)
+
+    if not nodes:
+        sample = repr(raw[:3])[:600] if isinstance(raw, list) else repr(raw)[:600]
+        raise ValueError(
+            "No valid IP:port candidates parsed. "
+            f"List length={len(raw) if isinstance(raw, list) else 'unknown'}; "
+            f"sample={sample}. The API may use another data format."
+        )
+
+    return nodes
+
+
+def test_tcp(node):
+    started = time.perf_counter()
+
+    result = {
+        **node,
+        "ok": False,
+        "latencyMs": None,
+        "testedAt": now().isoformat().replace("+00:00", "Z"),
+        "error": None,
+    }
+
+    try:
+        with socket.create_connection(
+            (node["ip"], node["port"]), timeout=TIMEOUT
+        ):
+            result["ok"] = True
+            result["latencyMs"] = round(
+                (time.perf_counter() - started) * 1000, 2
+            )
+
+    except socket.timeout:
+        result["error"] = f"TCP timeout after {TIMEOUT:g}s"
+
+    except OSError as exc:
+        result["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+
+    return result
+
+
 def read_previous(region):
- p=DATA/f'{region.lower()}.json'
- if not p.exists(): return []
- try:
-  x=json.loads(p.read_text(encoding='utf-8')); return x.get('nodes',[]) if isinstance(x,dict) and isinstance(x.get('nodes'),list) else []
- except Exception: return []
+    path = DATA / f"{region.lower()}.json"
+
+    if not path.exists():
+        return []
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+
+        if isinstance(data, dict) and isinstance(data.get("nodes"), list):
+            return data["nodes"]
+
+    except (OSError, json.JSONDecodeError) as exc:
+        print(
+            f"WARNING: Cannot read previous cache {path}: {exc}",
+            file=sys.stderr,
+        )
+
+    return []
+
+
+def build_index():
+    names = {
+        "JP": "Japan",
+        "HK": "Hong Kong",
+        "KR": "South Korea",
+        "CN": "China",
+        "US": "United States",
+        "SG": "Singapore",
+        "DE": "Germany",
+    }
+
+    links = "\n".join(
+        f'<li><a href="{r.lower()}.txt">{r} — '
+        f'{names.get(r, r)} TXT</a> '
+        f'(<a href="data/{r.lower()}.json">JSON details</a>)</li>'
+        for r in REGIONS
+    )
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Global TCP latency results</title>
+</head>
+<body>
+<h1>Global TCP latency results</h1>
+<p>TCP connection latency only. This does not verify proxy protocol
+usability or whether an IP is residential.</p>
+<ul>
+{links}
+</ul>
+<p>Each scheduled run scans one region and up to the configured batch size.
+Previous successful measurements are retained when retests fail.</p>
+</body>
+</html>
+"""
+    (OUT / "index.html").write_text(html, encoding="utf-8")
+
+
 def main():
- if not REGIONS: raise RuntimeError('REGIONS is empty')
- OUT.mkdir(exist_ok=True); DATA.mkdir(parents=True,exist_ok=True)
- slot=slot_number(); region=REGIONS[slot%len(REGIONS)]; round_no=slot//len(REGIONS)
- payload,source_bytes=fetch_json(SOURCE_URL+region); candidates=candidates_from(payload)
- start=(round_no*BATCH_SIZE)%len(candidates); batch=[candidates[(start+i)%len(candidates)] for i in range(min(BATCH_SIZE,len(candidates)))]
- print(f'region={region}; candidates={len(candidates)}; sourceBytes={source_bytes}; start={start}; testing={len(batch)}')
- with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as pool: results=list(pool.map(test_tcp,batch))
- success=[r for r in results if r['ok']]; print(f'tested={len(results)}; success={len(success)}; failed={len(results)-len(success)}')
- # Keep previous successful measurements for nodes not in this batch; failed retests never erase good records.
- merged={f"{n.get('ip')}:{n.get('port')}":n for n in read_previous(region) if n.get('ip') and n.get('port') and isinstance(n.get('latencyMs'),(int,float))}
- for r in success: merged[r['address']]={'ip':r['ip'],'port':r['port'],'latencyMs':r['latencyMs'],'testedAt':r['testedAt']}
- nodes=sorted(merged.values(),key=lambda n:(float(n['latencyMs']),n['ip'],int(n['port'])))[:500]
- # Output format kept compatible with the existing style: IP:PORT#REGION-NN-Nms
- lines=[]
- for i,n in enumerate(nodes,1):
-  ms=max(0,round(float(n['latencyMs'])))
-  lines.append(f"{n['ip']}:{n['port']}#{region}-{i:02d}-{ms}ms")
- (OUT/f'{region.lower()}.txt').write_text(('\n'.join(lines)+'\n') if lines else '',encoding='utf-8')
- record={'region':region,'source':'github-actions','updatedAt':now().isoformat().replace('+00:00','Z'),'candidateCount':len(candidates),'batchStartIndex':start,'testedCount':len(results),'successCount':len(success),'failedCount':len(results)-len(success),'nodes':nodes,'lastBatch':results}
- (DATA/f'{region.lower()}.json').write_text(json.dumps(record,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
- # landing page links to the seven plain-text files
- names={'JP':'Japan','HK':'Hong Kong','KR':'South Korea','CN':'China','US':'United States','SG':'Singapore','DE':'Germany'}
- links='\n'.join(f'<li><a href="{r.lower()}.txt">{r} — {names[r]} TXT</a> <small>(<a href="data/{r.lower()}.json">JSON details</a>)</small></li>' for r in REGIONS)
- (OUT/'index.html').write_text('<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Global TCP latency TXT</title><h1>Global TCP latency results</h1><p>Generated by GitHub Actions. TCP connect latency only; this does not verify proxy protocol usability.</p><ul>'+links+'</ul><p>Each scheduled run scans one region, up to 25 candidates. Results are cumulative successful TCP measurements; failed retests do not remove previous successes.</p></html>\n',encoding='utf-8')
- print(f'Wrote public/{region.lower()}.txt with {len(lines)} successful cached nodes')
-if __name__=='__main__':
- try: main()
- except Exception as e: print(f'ERROR: {type(e).__name__}: {e}',file=sys.stderr); sys.exit(1)
+    if not REGIONS:
+        raise RuntimeError("REGIONS is empty")
+
+    OUT.mkdir(parents=True, exist_ok=True)
+    DATA.mkdir(parents=True, exist_ok=True)
+
+    slot = slot_number()
+    region = REGIONS[slot % len(REGIONS)]
+    round_no = slot // len(REGIONS)
+
+    source_url = SOURCE_URL + region
+
+    print(f"Starting region={region}")
+    print(f"Source URL={source_url}")
+
+    payload, source_bytes = fetch_json(source_url)
+    candidates = candidates_from(payload)
+
+    start = (round_no * BATCH_SIZE) % len(candidates)
+    count = min(BATCH_SIZE, len(candidates))
+
+    batch = [
+        candidates[(start + i) % len(candidates)]
+        for i in range(count)
+    ]
+
+    print(
+        f"region={region}; candidates={len(candidates)}; "
+        f"sourceBytes={source_bytes}; start={start}; testing={len(batch)}"
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=CONCURRENCY
+    ) as pool:
+        results = list(pool.map(test_tcp, batch))
+
+    successful = [result for result in results if result["ok"]]
+    failed_count = len(results) - len(successful)
+
+    print(
+        f"tested={len(results)}; success={len(successful)}; "
+        f"failed={failed_count}"
+    )
+
+    # Retain successful cached measurements outside this batch.
+    # A failed retest will not erase a previously successful measurement.
+    merged = {}
+
+    for node in read_previous(region):
+        if not isinstance(node, dict):
+            continue
+
+        try:
+            ip = str(ipaddress.ip_address(str(node.get("ip"))))
+            port = int(node.get("port"))
+            latency = node.get("latencyMs")
+
+            if (
+                1 <= port <= 65535
+                and isinstance(latency, (int, float))
+                and latency >= 0
+            ):
+                address = f"{ip}:{port}"
+                merged[address] = {
+                    "ip": ip,
+                    "port": port,
+                    "latencyMs": latency,
+                    "testedAt": node.get("testedAt"),
+                }
+
+        except (ValueError, TypeError):
+            continue
+
+    for result in successful:
+        merged[result["address"]] = {
+            "ip": result["ip"],
+            "port": result["port"],
+            "latencyMs": result["latencyMs"],
+            "testedAt": result["testedAt"],
+        }
+
+    nodes = sorted(
+        merged.values(),
+        key=lambda n: (
+            float(n["latencyMs"]),
+            n["ip"],
+            int(n["port"]),
+        ),
+    )[:500]
+
+    # Preserve the existing TXT format:
+    # IP:PORT#REGION-NN-Nms
+    lines = []
+
+    for index, node in enumerate(nodes, 1):
+        ms = max(0, round(float(node["latencyMs"])))
+        lines.append(
+            f'{node["ip"]}:{node["port"]}#{region}-{index:02d}-{ms}ms'
+        )
+
+    txt_path = OUT / f"{region.lower()}.txt"
+    txt_path.write_text(
+        ("\n".join(lines) + "\n") if lines else "",
+        encoding="utf-8",
+    )
+
+    record = {
+        "region": region,
+        "source": "github-actions",
+        "updatedAt": now().isoformat().replace("+00:00", "Z"),
+        "candidateCount": len(candidates),
+        "batchStartIndex": start,
+        "testedCount": len(results),
+        "successCount": len(successful),
+        "failedCount": failed_count,
+        "nodes": nodes,
+        "lastBatch": results,
+    }
+
+    json_path = DATA / f"{region.lower()}.json"
+    json_path.write_text(
+        json.dumps(record, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    build_index()
+
+    print(
+        f"Wrote {txt_path} with {len(lines)} successful cached nodes; "
+        f"JSON={json_path}"
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(
+            f"ERROR: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
