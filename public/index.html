@@ -1,1 +1,24 @@
-<!doctype html><html lang="en"><meta charset="utf-8"><title>Global TCP latency results</title><h1>Global TCP latency results</h1><p>Run the GitHub Actions workflow to generate regional TXT files.</p><ul><li><a href="jp.txt">JP TXT</a></li><li><a href="hk.txt">HK TXT</a></li><li><a href="kr.txt">KR TXT</a></li><li><a href="cn.txt">CN TXT</a></li><li><a href="us.txt">US TXT</a></li><li><a href="sg.txt">SG TXT</a></li><li><a href="de.txt">DE TXT</a></li></ul></html>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Global TCP latency results</title>
+</head>
+<body>
+<h1>Global TCP latency results</h1>
+<p>TCP connection latency only. This does not verify proxy protocol
+usability or whether an IP is residential.</p>
+<ul>
+<li><a href="jp.txt">JP — Japan TXT</a> (<a href="data/jp.json">JSON details</a>)</li>
+<li><a href="hk.txt">HK — Hong Kong TXT</a> (<a href="data/hk.json">JSON details</a>)</li>
+<li><a href="kr.txt">KR — South Korea TXT</a> (<a href="data/kr.json">JSON details</a>)</li>
+<li><a href="cn.txt">CN — China TXT</a> (<a href="data/cn.json">JSON details</a>)</li>
+<li><a href="us.txt">US — United States TXT</a> (<a href="data/us.json">JSON details</a>)</li>
+<li><a href="sg.txt">SG — Singapore TXT</a> (<a href="data/sg.json">JSON details</a>)</li>
+<li><a href="de.txt">DE — Germany TXT</a> (<a href="data/de.json">JSON details</a>)</li>
+</ul>
+<p>Each scheduled run scans one region and up to the configured batch size.
+Previous successful measurements are retained when retests fail.</p>
+</body>
+</html>
