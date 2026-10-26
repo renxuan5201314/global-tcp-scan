@@ -1,48 +1,39 @@
-name: Cloudflare edge IP latency ranking
-
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: "*/30 * * * *"
-
-permissions:
-  contents: write
-
-concurrency:
-  group: global-tcp-scan
-  cancel-in-progress: false
-
-jobs:
-  scan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+```yaml
       - name: Download CloudflareSpeedTest
         shell: bash
         run: |
           set -euo pipefail
-          curl -fL --retry 3 https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.5/cfst_linux_amd64.tar.gz -o /tmp/cfst.tar.gz
-          tar -xzf /tmp/cfst.tar.gz -C "$GITHUB_WORKSPACE"
-          chmod +x "$GITHUB_WORKSPACE/cfst"
-          "$GITHUB_WORKSPACE/cfst" -v
-      - name: Scan all regions
-        run: python scanner.py
-      - name: Commit only seven region files
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add public/jp.txt public/hk.txt public/kr.txt public/cn.txt public/us.txt public/sg.txt public/de.txt
-          if git diff --cached --quiet; then
-            echo "No output changes to commit."
-          else
-            git commit -m "Update regional Cloudflare latency rankings"
-            git push
+
+          URL="https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.5/cfst_linux_amd64.tar.gz"
+          ARCHIVE="/tmp/cfst.tar.gz"
+          EXTRACT_DIR="/tmp/cfst-extract"
+
+          mkdir -p "$EXTRACT_DIR"
+
+          curl -fL --retry 3 "$URL" -o "$ARCHIVE"
+
+          echo "=== Archive contents ==="
+          tar -tzf "$ARCHIVE"
+
+          tar -xzf "$ARCHIVE" -C "$EXTRACT_DIR"
+
+          echo "=== Extracted files ==="
+          find "$EXTRACT_DIR" -maxdepth 3 -type f -print
+
+          # 自动查找解压出来的 Linux 可执行程序
+          BIN="$(find "$EXTRACT_DIR" -maxdepth 3 -type f \
+            \( -name 'cfst' -o -name 'CloudflareST' -o -name 'CloudflareSpeedTest' \) \
+            -print -quit)"
+
+          if [ -z "$BIN" ]; then
+            echo "::error::找不到 CloudflareSpeedTest 可执行文件，请检查上面的压缩包内容。"
+            exit 1
           fi
+
+          chmod +x "$BIN"
+          cp "$BIN" "$GITHUB_WORKSPACE/cfst"
+          chmod +x "$GITHUB_WORKSPACE/cfst"
+
+          echo "=== Verify executable ==="
+          "$GITHUB_WORKSPACE/cfst" -v
+```
