@@ -1,6 +1,6 @@
 {
-  "lastCompletedAt": "2026-10-26T06:25:51.891427Z",
-  "roundNo": 1,
+  "lastCompletedAt": "2026-10-26T07:46:19.849039Z",
+  "roundNo": 2,
   "regions": [
     "JP",
     "HK",
@@ -10,5 +10,8 @@
     "SG",
     "DE"
   ],
-  "lastErrors": []
+  "lastErrors": [
+    "CN: no successful HTTPS result; old files retained"
+  ],
+  "anyRegionUpdated": true
 }
