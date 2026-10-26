@@ -1,35 +1,26 @@
+```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Regional proxy latency scanner.
+Regional Cloudflare IP scanner using official XIU2/CloudflareSpeedTest HTTPing.
 
-Features:
-- Fetch nodes from proxy.seeck.cn regional APIs.
-- Measure latency using the site's responseTime API.
-- Require success=True and probe_results.ipv4.ok=True.
-- Test each endpoint 3 times and use the median latency.
-- Keep the best 30 endpoints for each source region.
-- Preserve old TXT files when a scan fails or looks incomplete.
-- Atomic file replacement.
-- Detailed logging and JSON diagnostics.
-
-Latency source:
-    https://api.090227.xyz/check?proxyip=IP:PORT
-
-Important:
-- Does not fall back to local TCP-connect timing.
-- responseTime is the ranking latency.
-- The API's own success and IPv4 probe status must both be successful.
+Requirements:
+- Put CloudflareST.exe or cfst.exe beside this script on Windows.
+- Fetch candidates from proxy.seeck.cn for seven regions.
+- Test every candidate IP using official CFST HTTPing.
+- Keep the 30 lowest average-latency IPs per region.
+- Preserve TXT format, atomic writes, detailed logs and JSON diagnostics.
+- Never replace an existing TXT when a scan fails validation.
 """
 
-import concurrent.futures
+import csv
 import ipaddress
 import json
 import logging
-import math
 import os
 import re
-import statistics
+import shutil
+import subprocess
 import time
 import urllib.parse
 import urllib.request
@@ -38,94 +29,72 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-# -------------------- Configuration --------------------
+# ==================== Configuration ====================
 
 ROOT = Path(__file__).resolve().parent
 PUBLIC = ROOT / "public"
 LOG_DIR = ROOT / "logs"
 DATA_DIR = PUBLIC / "data"
+WORK_DIR = ROOT / "work_cfst"
 
 REGIONS = ("JP", "HK", "KR", "CN", "US", "SG", "DE")
 
 NODE_API = "https://proxy.seeck.cn/api/nodes?region="
-SPEED_API = "https://api.090227.xyz/check?proxyip="
+USER_AGENT = "regional-cfst-httping-scanner/3.0"
 
 TOP_N = 30
 REPEAT_COUNT = 3
-
-# Avoid overloading the remote service.
-MAX_WORKERS = 4
+MAX_WORKERS = 10
 
 NODE_API_TIMEOUT = 30
-SPEED_API_TIMEOUT = 30
+CFST_TIMEOUT_SECONDS = 3600
 
-# Protect old files against suspiciously incomplete scans.
+HTTPING_URL = "https://cf.xiu2.xyz/url"
+HTTPING_PORT = 443
+
+# Reject a scan if too few IPs were measured successfully.
 MIN_SUCCESS_RESULTS = 3
 MIN_SUCCESS_RATIO = 0.10
 
-USER_AGENT = "regional-proxy-latency-scanner/2.1"
-
-MAX_ACCEPTABLE_LATENCY_MS = 120000
+# If an old TXT exists, do not replace it with fewer than this many entries.
+MIN_OUTPUT_COUNT = 3
 
 WRITE_DIAGNOSTICS = True
 
-# Delay between repeated requests to the same endpoint.
-REPEAT_DELAY_SECONDS = 0.15
+# Usually leave empty. Auto-detection checks the script directory and PATH.
+# Example: r"D:\Tools\CloudflareST.exe"
+CFST_EXECUTABLE = ""
+
+IP_PATTERN = re.compile(
+    r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])"
+)
+ENDPOINT_PATTERN = re.compile(
+    r"(?<![\d.])((?:\d{1,3}\.){3}\d{1,3})\s*:\s*(\d{1,5})(?!\d)"
+)
 
 
-# -------------------- Directory setup --------------------
+# ==================== Directories and logging ====================
 
-PUBLIC.mkdir(parents=True, exist_ok=True)
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# -------------------- Logging --------------------
-
-log_file = LOG_DIR / "scanner.log"
+for directory in (PUBLIC, LOG_DIR, DATA_DIR, WORK_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(log_file, encoding="utf-8"),
+        logging.FileHandler(
+            LOG_DIR / "scanner.log",
+            encoding="utf-8",
+        ),
     ],
 )
+log = logging.getLogger("regional-cfst-scanner")
 
-log = logging.getLogger("regional-scanner")
 
-
-# -------------------- HTTP helpers --------------------
-
-def http_get_text(url, timeout):
-    """GET a URL and return decoded response text."""
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "application/json, text/plain, */*",
-        },
-        method="GET",
-    )
-
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        status = getattr(response, "status", 200)
-
-        if status < 200 or status >= 300:
-            raise RuntimeError(f"HTTP status {status}")
-
-        raw = response.read()
-        charset = response.headers.get_content_charset() or "utf-8"
-
-        return raw.decode(charset, errors="replace")
-
+# ==================== Atomic file writes ====================
 
 def atomic_write_text(path, content):
-    """
-    Write a temporary file in the same directory and atomically replace
-    the destination only after the write completes successfully.
-    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -153,50 +122,147 @@ def atomic_write_text(path, content):
 
 
 def atomic_write_json(path, data):
-    content = json.dumps(
-        data,
-        ensure_ascii=False,
-        indent=2,
-    ) + "\n"
-
-    atomic_write_text(path, content)
+    atomic_write_text(
+        path,
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+    )
 
 
-# -------------------- Node discovery --------------------
+# ==================== HTTP helpers ====================
 
-ENDPOINT_PATTERN = re.compile(
-    r"(?<![\d.])((?:\d{1,3}\.){3}\d{1,3})\s*:\s*(\d{1,5})(?!\d)"
-)
+def http_get_text(url, timeout):
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+        },
+        method="GET",
+    )
+
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        status = getattr(response, "status", 200)
+
+        if not 200 <= status < 300:
+            raise RuntimeError(f"HTTP status {status}: {url}")
+
+        raw = response.read()
+        charset = response.headers.get_content_charset() or "utf-8"
+
+        return raw.decode(charset, errors="replace")
+
+
+# ==================== Candidate discovery ====================
+
+def valid_ip(value):
+    try:
+        return str(ipaddress.IPv4Address(str(value).strip()))
+    except (ValueError, TypeError):
+        return None
+
+
+def valid_port(value, default=443):
+    try:
+        port = int(value)
+        return port if 1 <= port <= 65535 else default
+    except (ValueError, TypeError):
+        return default
+
+
+def extract_endpoint_string(value, results):
+    if not isinstance(value, str):
+        return
+
+    for match in ENDPOINT_PATTERN.finditer(value):
+        ip = valid_ip(match.group(1))
+        port = valid_port(match.group(2), default=0)
+
+        if ip and port:
+            results.add((ip, port))
+
+
+def walk_node_json(value, results):
+    """
+    Parse structured node records instead of regex-scanning serialized JSON.
+    Recognizes common IP, host, address, endpoint and port fields.
+    """
+    if isinstance(value, list):
+        for item in value:
+            walk_node_json(item, results)
+        return
+
+    if not isinstance(value, dict):
+        if isinstance(value, str):
+            extract_endpoint_string(value, results)
+        return
+
+    lowered = {str(k).lower(): v for k, v in value.items()}
+
+    # Find an address-like field in this object.
+    address = None
+    for key in (
+        "endpoint", "proxyip", "proxy_ip", "ip_port",
+        "ipport", "address", "addr", "ip", "ipv4",
+        "host", "server",
+    ):
+        candidate = lowered.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            address = candidate.strip()
+            break
+
+    # Find a port field if the address did not already include one.
+    port_value = 443
+    for key in ("port", "portremote", "port_remote", "remoteport"):
+        if key in lowered:
+            port_value = lowered[key]
+            break
+
+    if address:
+        if ENDPOINT_PATTERN.fullmatch(address):
+            extract_endpoint_string(address, results)
+        else:
+            ip = valid_ip(address)
+            if ip:
+                results.add((ip, valid_port(port_value)))
+
+    # Recurse into nested node collections.
+    for key, child in value.items():
+        if isinstance(child, (dict, list)):
+            walk_node_json(child, results)
+        elif isinstance(child, str):
+            # Only accept explicit endpoint strings, not arbitrary IPs
+            # appearing in unrelated metadata.
+            if ENDPOINT_PATTERN.fullmatch(child.strip()):
+                extract_endpoint_string(child.strip(), results)
 
 
 def extract_endpoints(text):
-    """
-    Extract unique IPv4:port endpoints from a JSON or plain-text response.
+    results = set()
 
-    Note:
-    This uses endpoint-pattern extraction because the precise node JSON
-    schema has not been supplied here. If the source contains unrelated
-    IPv4:port strings, those could also be extracted.
-    """
-    found = set()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
 
-    for match in ENDPOINT_PATTERN.finditer(text):
-        ip_text, port_text = match.groups()
+    if payload is not None:
+        walk_node_json(payload, results)
+    else:
+        # Plain-text fallback.
+        for match in ENDPOINT_PATTERN.finditer(text):
+            ip = valid_ip(match.group(1))
+            port = valid_port(match.group(2), default=0)
+            if ip and port:
+                results.add((ip, port))
 
-        try:
-            ip = str(ipaddress.IPv4Address(ip_text))
-            port = int(port_text)
-
-            if not 1 <= port <= 65535:
-                continue
-
-            found.add((ip, port))
-
-        except ValueError:
-            continue
+        # If the plain-text source consists of bare IPs, assume port 443.
+        if not results:
+            for match in IP_PATTERN.finditer(text):
+                ip = valid_ip(match.group(0))
+                if ip:
+                    results.add((ip, 443))
 
     return sorted(
-        found,
+        results,
         key=lambda item: (
             tuple(int(part) for part in item[0].split(".")),
             item[1],
@@ -205,385 +271,347 @@ def extract_endpoints(text):
 
 
 def fetch_region(region):
-    """Fetch candidates for one source region."""
     url = NODE_API + urllib.parse.quote(region, safe="")
 
     log.info("[%s] Fetching candidates: %s", region, url)
 
     text = http_get_text(url, NODE_API_TIMEOUT)
-
-    try:
-        payload = json.loads(text)
-        searchable_text = json.dumps(
-            payload,
-            ensure_ascii=False,
-        )
-    except json.JSONDecodeError:
-        searchable_text = text
-
-    endpoints = extract_endpoints(searchable_text)
+    endpoints = extract_endpoints(text)
 
     if not endpoints:
         raise RuntimeError(
-            "API returned no valid IPv4:port endpoints; "
-            "existing output retained"
+            "No valid IPv4:port candidates found; existing TXT retained"
         )
 
     log.info(
-        "[%s] Found %d unique endpoints",
+        "[%s] Found %d candidate endpoints, %d unique IPs",
         region,
         len(endpoints),
+        len({ip for ip, _ in endpoints}),
     )
 
     return endpoints
 
 
-# -------------------- Site latency API --------------------
+# ==================== Official CFST executable ====================
 
-def parse_latency_value(value):
-    """
-    Parse responseTime into milliseconds.
-
-    Numeric values are interpreted as milliseconds.
-    Strings such as '123ms' are also accepted.
-    """
-    if isinstance(value, bool) or value is None:
-        raise ValueError("responseTime is missing or invalid")
-
-    if isinstance(value, (int, float)):
-        latency = float(value)
-
-    elif isinstance(value, str):
-        cleaned = value.strip().lower()
-        cleaned = re.sub(r"\s*ms\s*$", "", cleaned)
-        latency = float(cleaned)
-
-    else:
-        raise ValueError(
-            "Unsupported responseTime type: "
-            f"{type(value).__name__}"
+def resolve_cfst_executable():
+    if CFST_EXECUTABLE:
+        path = Path(CFST_EXECUTABLE)
+        if path.is_file():
+            return str(path.resolve())
+        raise FileNotFoundError(
+            f"CFST_EXECUTABLE does not exist: {path}"
         )
 
-    if not math.isfinite(latency):
-        raise ValueError("responseTime is not finite")
+    names = (
+        "CloudflareST.exe",
+        "cfst.exe",
+        "CloudflareSpeedTest.exe",
+        "CloudflareST",
+        "cfst",
+        "CloudflareSpeedTest",
+    )
 
-    if latency < 0 or latency > MAX_ACCEPTABLE_LATENCY_MS:
-        raise ValueError(
-            f"responseTime out of range: {latency}"
+    for name in names:
+        path = ROOT / name
+        if path.is_file():
+            return str(path.resolve())
+
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+
+    raise FileNotFoundError(
+        "Official CloudflareSpeedTest executable not found. "
+        "Put CloudflareST.exe or cfst.exe beside scanner.py, "
+        "or configure CFST_EXECUTABLE at the top of this file."
+    )
+
+
+def run_cfst(region, endpoints, executable):
+    """
+    Test every unique candidate IPv4 address using official CFST HTTPing.
+    -allip is important: it prevents the default random-per-/24 behavior.
+    """
+    ips = sorted(
+        {ip for ip, _port in endpoints},
+        key=lambda value: tuple(int(p) for p in value.split(".")),
+    )
+
+    if not ips:
+        raise RuntimeError("No IPv4 addresses to test")
+
+    region_dir = WORK_DIR / region.lower()
+    region_dir.mkdir(parents=True, exist_ok=True)
+
+    input_path = region_dir / "candidates.txt"
+    output_path = region_dir / "result.csv"
+    stdout_path = region_dir / "cfst.stdout.log"
+    stderr_path = region_dir / "cfst.stderr.log"
+
+    atomic_write_text(input_path, "\n".join(ips) + "\n")
+
+    try:
+        output_path.unlink(missing_ok=True)
+    except OSError as error:
+        raise RuntimeError(
+            f"Cannot clear previous CFST result file: {error}"
+        ) from error
+
+    command = [
+        executable,
+        "-f", str(input_path),
+        "-allip",
+        "-o", str(output_path),
+        "-p", "0",
+        "-n", str(MAX_WORKERS),
+        "-t", str(REPEAT_COUNT),
+        "-tp", str(HTTPING_PORT),
+        "-httping",
+        "-url", HTTPING_URL,
+        "-dd",
+        "-debug",
+    ]
+
+    log.info(
+        "[%s] Starting official CFST HTTPing: IPs=%d, repeats=%d, "
+        "workers=%d, port=%d, URL=%s",
+        region,
+        len(ips),
+        REPEAT_COUNT,
+        MAX_WORKERS,
+        HTTPING_PORT,
+        HTTPING_URL,
+    )
+    log.info(
+        "[%s] Command: %s",
+        region,
+        subprocess.list2cmdline(command),
+    )
+
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=CFST_TIMEOUT_SECONDS,
+            check=False,
         )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"CFST timed out after {CFST_TIMEOUT_SECONDS} seconds"
+        ) from error
+
+    atomic_write_text(stdout_path, completed.stdout or "")
+    atomic_write_text(stderr_path, completed.stderr or "")
+
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"CFST exited with code {completed.returncode}; "
+            f"inspect {stdout_path.relative_to(ROOT)} and "
+            f"{stderr_path.relative_to(ROOT)}"
+        )
+
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RuntimeError(
+            "CFST produced no CSV output; old TXT retained. "
+            "Check the HTTPing URL, port and CFST logs."
+        )
+
+    ranked = parse_cfst_csv(output_path, ips)
+
+    log.info(
+        "[%s] CFST returned %d valid IP results out of %d candidates",
+        region,
+        len(ranked),
+        len(ips),
+    )
+
+    return ranked
+
+
+# ==================== Parse official CFST CSV ====================
+
+def normalize_header(value):
+    return re.sub(
+        r"[\s_\-()（）]+",
+        "",
+        str(value).strip().lower(),
+    )
+
+
+def parse_latency_ms(value):
+    text = str(value).strip().lower()
+    text = text.replace("毫秒", "").replace("ms", "").strip()
+    text = text.replace(",", "")
+
+    latency = float(text)
+
+    if latency < 0 or latency > 120000:
+        raise ValueError(f"Latency out of range: {value!r}")
 
     return latency
 
 
-def find_response_time(payload):
+def parse_cfst_csv(csv_path, candidate_ips):
     """
-    Validate the known API response structure.
+    Official CFST CSV commonly contains:
+    IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码
 
-    A response is accepted only if:
-    - payload is a JSON object;
-    - success is exactly True;
-    - probe_results.ipv4 exists;
-    - probe_results.ipv4.ok is exactly True;
-    - responseTime is present and valid.
-
-    The ranking latency comes from responseTime, not local HTTP elapsed time.
+    Ranking uses the official average-latency column.
     """
-    if not isinstance(payload, dict):
-        raise ValueError("Latency API response is not a JSON object")
+    allowed_ips = set(candidate_ips)
+    by_ip = {}
 
-    if payload.get("success") is not True:
-        raise ValueError(
-            "Latency API did not report success=True; "
-            f"received {payload.get('success')!r}"
-        )
-
-    probe_results = payload.get("probe_results")
-
-    if not isinstance(probe_results, dict):
-        raise ValueError("Missing or invalid probe_results")
-
-    ipv4_result = probe_results.get("ipv4")
-
-    if not isinstance(ipv4_result, dict):
-        raise ValueError("Missing or invalid probe_results.ipv4")
-
-    if ipv4_result.get("ok") is not True:
-        raise ValueError(
-            "IPv4 probe failed; "
-            f"error={ipv4_result.get('error')!r}"
-        )
-
-    if "responseTime" not in payload:
-        raise ValueError("Missing responseTime")
-
-    return parse_latency_value(payload["responseTime"])
-
-
-def probe_once(ip, port):
-    """
-    Ask the site's latency API to measure one endpoint.
-
-    Local API request duration is recorded for diagnostics only.
-    It is never used as the endpoint ranking latency.
-    """
-    endpoint = f"{ip}:{port}"
-
-    query = urllib.parse.urlencode({
-        "proxyip": endpoint,
-    })
-
-    url = f"{SPEED_API}{query}"
-    started = time.perf_counter()
-
-    try:
-        text = http_get_text(url, SPEED_API_TIMEOUT)
-
-        elapsed_ms = (
-            time.perf_counter() - started
-        ) * 1000
+    with open(
+        csv_path,
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as handle:
+        sample = handle.read(8192)
+        handle.seek(0)
 
         try:
-            payload = json.loads(text)
+            dialect = csv.Sniffer().sniff(
+                sample,
+                delimiters=",;\t",
+            )
+        except csv.Error:
+            dialect = csv.excel
 
-        except json.JSONDecodeError as error:
-            raise ValueError(
-                "Latency API returned non-JSON content: "
-                f"{text[:200]!r}"
-            ) from error
+        reader = csv.DictReader(handle)
 
-        latency_ms = find_response_time(payload)
+        if not reader.fieldnames:
+            raise RuntimeError("CFST CSV has no header")
 
-        return {
-            "ok": True,
-            "latency_ms": latency_ms,
-            "api_elapsed_ms": round(elapsed_ms, 2),
-            "api_success": payload.get("success"),
-            "ipv4_probe_ok": (
-                payload.get("probe_results", {})
-                .get("ipv4", {})
-                .get("ok")
-            ),
-            "colo": payload.get("colo"),
-            "error": None,
+        headers = {
+            normalize_header(header): header
+            for header in reader.fieldnames
         }
 
-    except Exception as error:
-        elapsed_ms = (
-            time.perf_counter() - started
-        ) * 1000
+        ip_header = None
+        latency_header = None
+        loss_header = None
 
-        return {
-            "ok": False,
-            "latency_ms": None,
-            "api_elapsed_ms": round(elapsed_ms, 2),
-            "api_success": None,
-            "ipv4_probe_ok": None,
-            "colo": None,
-            "error": f"{type(error).__name__}: {error}",
-        }
+        for normalized, original in headers.items():
+            if normalized in ("ip地址", "ip", "ipaddress", "address"):
+                ip_header = original
+                break
 
+        for normalized, original in headers.items():
+            if (
+                normalized == "平均延迟"
+                or normalized in ("averagelatency", "averagedelay")
+            ):
+                latency_header = original
+                break
 
-def probe_endpoint(ip, port):
-    """
-    Test an endpoint REPEAT_COUNT times.
+        for normalized, original in headers.items():
+            if normalized in ("丢包率", "lossrate", "packetloss"):
+                loss_header = original
+                break
 
-    All attempts must succeed. The median responseTime is used for ranking.
-    """
-    measurements = []
-    attempts = []
-    errors = []
+        if ip_header is None:
+            ip_header = reader.fieldnames[0]
 
-    for attempt in range(1, REPEAT_COUNT + 1):
-        result = probe_once(ip, port)
+        if latency_header is None:
+            raise RuntimeError(
+                "Cannot find CFST average-latency column. "
+                f"CSV headers: {reader.fieldnames!r}"
+            )
 
-        attempts.append({
-            "attempt": attempt,
-            "ok": result["ok"],
-            "latency_ms": result["latency_ms"],
-            "api_elapsed_ms": result["api_elapsed_ms"],
-            "api_success": result["api_success"],
-            "ipv4_probe_ok": result["ipv4_probe_ok"],
-            "colo": result["colo"],
-            "error": result["error"],
-        })
+        for row in reader:
+            if not row:
+                continue
 
-        if result["ok"]:
-            measurements.append(result["latency_ms"])
-        else:
-            errors.append({
-                "attempt": attempt,
-                "error": result["error"],
-            })
+            ip_cell = (row.get(ip_header) or "").strip()
+            match = IP_PATTERN.search(ip_cell)
 
-        if attempt < REPEAT_COUNT:
-            time.sleep(REPEAT_DELAY_SECONDS)
+            if not match:
+                continue
 
-    complete = len(measurements) == REPEAT_COUNT
+            ip = valid_ip(match.group(0))
 
-    record = {
-        "ip": ip,
-        "port": port,
-        "endpoint": f"{ip}:{port}",
-        "attempts_requested": REPEAT_COUNT,
-        "attempts_succeeded": len(measurements),
-        "attempts": attempts,
-        "measurements_ms": measurements,
-        "errors": errors,
-        "complete": complete,
-        "latency_ms": (
-            round(statistics.median(measurements), 2)
-            if complete
-            else None
-        ),
-        "minimum_ms": (
-            round(min(measurements), 2)
-            if complete
-            else None
-        ),
-        "maximum_ms": (
-            round(max(measurements), 2)
-            if complete
-            else None
-        ),
-        "spread_ms": (
-            round(max(measurements) - min(measurements), 2)
-            if complete
-            else None
-        ),
-    }
+            if not ip or ip not in allowed_ips:
+                continue
 
-    return record
-
-
-# -------------------- Region scanning --------------------
-
-def scan_region(region, endpoints):
-    """Measure all endpoints in a region concurrently."""
-    started = time.monotonic()
-    records = []
-
-    log.info(
-        "[%s] Starting measurements: endpoints=%d, repeats=%d, workers=%d",
-        region,
-        len(endpoints),
-        REPEAT_COUNT,
-        MAX_WORKERS,
-    )
-
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=MAX_WORKERS
-    ) as executor:
-
-        future_to_endpoint = {
-            executor.submit(probe_endpoint, ip, port): (ip, port)
-            for ip, port in endpoints
-        }
-
-        completed = 0
-        total = len(future_to_endpoint)
-
-        for future in concurrent.futures.as_completed(
-            future_to_endpoint
-        ):
-            ip, port = future_to_endpoint[future]
-            completed += 1
+            latency_cell = row.get(latency_header)
 
             try:
-                record = future.result()
+                latency = parse_latency_ms(latency_cell)
+            except (ValueError, TypeError):
+                continue
 
-            except Exception as error:
-                record = {
-                    "ip": ip,
-                    "port": port,
-                    "endpoint": f"{ip}:{port}",
-                    "attempts_requested": REPEAT_COUNT,
-                    "attempts_succeeded": 0,
-                    "attempts": [],
-                    "measurements_ms": [],
-                    "errors": [{
-                        "error": f"Unhandled exception: {error}",
-                    }],
-                    "complete": False,
-                    "latency_ms": None,
-                    "minimum_ms": None,
-                    "maximum_ms": None,
-                    "spread_ms": None,
-                }
+            loss_value = 0.0
 
-            record["region"] = region
-            records.append(record)
+            if loss_header and row.get(loss_header):
+                raw_loss = str(row[loss_header]).strip()
+                raw_loss = raw_loss.replace("%", "")
 
-            if record["complete"]:
-                log.info(
-                    "[%s] [%d/%d] %s latency=%.2fms spread=%.2fms",
-                    region,
-                    completed,
-                    total,
-                    record["endpoint"],
-                    record["latency_ms"],
-                    record["spread_ms"],
-                )
-            else:
-                log.warning(
-                    "[%s] [%d/%d] %s incomplete: %d/%d successful attempts",
-                    region,
-                    completed,
-                    total,
-                    record["endpoint"],
-                    record["attempts_succeeded"],
-                    REPEAT_COUNT,
-                )
+                try:
+                    loss_value = float(raw_loss)
+                    if "%" in str(row[loss_header]):
+                        loss_value /= 100.0
+                except ValueError:
+                    continue
 
-    successful = [
-        record for record in records
-        if record["complete"]
-    ]
+            # Reject rows that report packet loss. This avoids ranking
+            # a low average latency when the IP is not consistently usable.
+            if loss_value > 0:
+                continue
 
-    elapsed = round(time.monotonic() - started, 2)
+            result = {
+                "ip": ip,
+                "latency_ms": round(latency, 2),
+                "loss_rate": loss_value,
+                "raw_csv": row,
+            }
 
-    log.info(
-        "[%s] Scan finished: candidates=%d complete=%d "
-        "incomplete=%d elapsed=%.2fs",
-        region,
-        len(endpoints),
-        len(successful),
-        len(records) - len(successful),
-        elapsed,
+            previous = by_ip.get(ip)
+
+            if previous is None or latency < previous["latency_ms"]:
+                by_ip[ip] = result
+
+    return sorted(
+        by_ip.values(),
+        key=lambda row: (
+            row["latency_ms"],
+            tuple(int(part) for part in row["ip"].split(".")),
+        ),
     )
 
-    return records
 
+# ==================== Validation and TXT generation ====================
 
-# -------------------- Output validation --------------------
+def validate_results(region, endpoints, ranked, target):
+    candidate_ips = {ip for ip, _port in endpoints}
 
-def validate_results(region, endpoints, records, target):
-    """
-    Refuse to replace an existing output when results appear incomplete.
-    """
-    candidate_count = len(endpoints)
-
-    success_records = [
-        record for record in records
-        if record.get("complete")
+    valid = [
+        row for row in ranked
+        if row.get("ip") in candidate_ips
+        and isinstance(row.get("latency_ms"), (int, float))
+        and 0 <= row["latency_ms"] <= 120000
+        and row.get("loss_rate", 0) == 0
     ]
 
-    success_count = len(success_records)
-
-    if candidate_count == 0:
-        raise RuntimeError("No candidates were discovered")
-
-    if success_count < MIN_SUCCESS_RESULTS:
+    if len(valid) < MIN_SUCCESS_RESULTS:
         raise RuntimeError(
-            f"Only {success_count} complete results; "
-            f"minimum required is {MIN_SUCCESS_RESULTS}"
+            f"Only {len(valid)} valid zero-loss results; "
+            f"minimum required is {MIN_SUCCESS_RESULTS}. "
+            "Old TXT retained."
         )
 
-    success_ratio = success_count / candidate_count
+    success_ratio = len(valid) / max(1, len(candidate_ips))
 
     if target.is_file() and target.stat().st_size > 0:
         old_lines = [
-            line
-            for line in target.read_text(
+            line for line in target.read_text(
                 encoding="utf-8",
                 errors="replace",
             ).splitlines()
@@ -595,67 +623,59 @@ def validate_results(region, endpoints, records, target):
             and success_ratio < MIN_SUCCESS_RATIO
         ):
             raise RuntimeError(
-                f"Suspiciously low success ratio "
-                f"{success_ratio:.1%}; existing output retained"
+                f"Suspicious success ratio {success_ratio:.1%}; "
+                "old TXT retained."
             )
 
-    if not success_records:
-        raise RuntimeError("No complete latency records")
+    if len(valid) < MIN_OUTPUT_COUNT:
+        raise RuntimeError(
+            f"Only {len(valid)} results available; "
+            "old TXT retained."
+        )
 
-    candidate_set = set(endpoints)
-
-    for record in success_records:
-        key = (record["ip"], record["port"])
-
-        if key not in candidate_set:
-            raise RuntimeError(
-                f"Unexpected endpoint in results: {record['endpoint']}"
-            )
-
-    return success_records, success_ratio
+    return valid, success_ratio
 
 
-# -------------------- TXT generation --------------------
-
-def build_txt(region, best):
-    """
-    Build subscription-compatible TXT lines.
-
-    Example:
-        129.154.212.204:443#JP-01-133ms
-    """
+def build_txt(region, ranked, endpoint_ports):
     lines = []
 
-    for rank, record in enumerate(best, start=1):
-        latency = record["latency_ms"]
+    for rank, row in enumerate(ranked[:TOP_N], start=1):
+        ip = row["ip"]
+        ports = endpoint_ports.get(ip, [443])
+
+        # The confirmed use case is Cloudflare CDN on port 443.
+        # If the source contains another port for the same IP, prefer 443.
+        port = 443 if 443 in ports else ports[0]
 
         lines.append(
-            f"{record['ip']}:{record['port']}"
-            f"#{region}-{rank:02d}-{latency:.0f}ms"
+            f"{ip}:{port}"
+            f"#{region}-{rank:02d}-{row['latency_ms']:.0f}ms"
         )
 
     return "\n".join(lines) + "\n"
 
 
-# -------------------- Region processing --------------------
+# ==================== Process one region ====================
 
-def process_region(region):
+def process_region(region, executable):
     target = PUBLIC / f"{region.lower()}.txt"
     diagnostic_path = DATA_DIR / f"{region.lower()}.json"
 
-    started_at = datetime.now(timezone.utc).isoformat()
-
     diagnostic = {
         "region": region,
-        "started_at": started_at,
+        "started_at": datetime.now(timezone.utc).isoformat(),
         "node_api": NODE_API + region,
-        "speed_api": SPEED_API,
+        "cfst_executable": executable,
+        "mode": "official CloudflareSpeedTest HTTPing",
+        "httping_url": HTTPING_URL,
+        "httping_port": HTTPING_PORT,
         "repeat_count": REPEAT_COUNT,
+        "workers": MAX_WORKERS,
         "top_n": TOP_N,
         "status": "failed",
         "candidate_count": 0,
-        "complete_count": 0,
-        "incomplete_count": 0,
+        "unique_ip_count": 0,
+        "result_count": 0,
         "success_ratio": 0,
         "results": [],
         "error": None,
@@ -665,101 +685,84 @@ def process_region(region):
 
     try:
         endpoints = fetch_region(region)
-
         diagnostic["candidate_count"] = len(endpoints)
 
-        records = scan_region(region, endpoints)
+        endpoint_ports = {}
 
-        diagnostic["complete_count"] = sum(
-            1 for record in records
-            if record["complete"]
-        )
+        for ip, port in endpoints:
+            endpoint_ports.setdefault(ip, []).append(port)
 
-        diagnostic["incomplete_count"] = (
-            len(records) - diagnostic["complete_count"]
-        )
+        diagnostic["unique_ip_count"] = len(endpoint_ports)
 
-        diagnostic["results"] = records
+        ranked = run_cfst(region, endpoints, executable)
+        diagnostic["results"] = ranked
+        diagnostic["result_count"] = len(ranked)
 
-        successful, success_ratio = validate_results(
+        valid, success_ratio = validate_results(
             region,
             endpoints,
-            records,
+            ranked,
             target,
         )
 
-        diagnostic["success_ratio"] = round(
-            success_ratio,
-            4,
-        )
-
-        best = sorted(
-            successful,
-            key=lambda record: (
-                record["latency_ms"],
-                record["spread_ms"],
-                tuple(
-                    int(part)
-                    for part in record["ip"].split(".")
-                ),
-                record["port"],
-            ),
-        )[:TOP_N]
-
-        if not best:
-            raise RuntimeError(
-                "No ranked results after validation"
-            )
-
-        content = build_txt(region, best)
-
-        # Validate generated TXT content before replacing the old file.
+        best = valid[:TOP_N]
+        content = build_txt(region, best, endpoint_ports)
         lines = [
             line for line in content.splitlines()
             if line.strip()
         ]
 
-        if not lines:
-            raise RuntimeError("Generated TXT content is empty")
+        if len(lines) < MIN_OUTPUT_COUNT:
+            raise RuntimeError(
+                f"Generated only {len(lines)} lines; old TXT retained."
+            )
 
         for line in lines:
-            if "#" not in line or ":" not in line:
-                raise RuntimeError(
-                    f"Malformed output line: {line!r}"
-                )
+            if not re.fullmatch(
+                r"\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}"
+                r"#[A-Z]{2}-\d{2}-\d+ms",
+                line,
+            ):
+                raise RuntimeError(f"Malformed output line: {line!r}")
 
-        # Existing TXT is replaced only after all checks pass.
+        # Only replace the previous TXT after all checks have passed.
         atomic_write_text(target, content)
 
-        diagnostic["status"] = "success"
-        diagnostic["output_count"] = len(lines)
-        diagnostic["output_file"] = str(
-            target.relative_to(ROOT)
-        )
-        diagnostic["finished_at"] = (
-            datetime.now(timezone.utc).isoformat()
-        )
+        diagnostic.update({
+            "status": "success",
+            "success_count": len(valid),
+            "success_ratio": round(success_ratio, 4),
+            "output_count": len(lines),
+            "output_file": str(target.relative_to(ROOT)),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        })
 
         log.info(
-            "[%s] Updated %s with %d entries "
-            "(success ratio %.1f%%)",
+            "[%s] Updated %s: %d entries, %d candidate IPs, "
+            "%d valid results, success ratio %.1f%%",
             region,
             target.name,
             len(lines),
+            len(endpoint_ports),
+            len(valid),
             success_ratio * 100,
         )
 
+        for row in best[:5]:
+            log.info(
+                "[%s] TOP %s latency=%.2fms",
+                region,
+                row["ip"],
+                row["latency_ms"],
+            )
+
     except Exception as error:
         diagnostic["status"] = "failed"
-        diagnostic["error"] = (
-            f"{type(error).__name__}: {error}"
-        )
-        diagnostic["finished_at"] = (
-            datetime.now(timezone.utc).isoformat()
-        )
+        diagnostic["error"] = f"{type(error).__name__}: {error}"
+        diagnostic["finished_at"] = datetime.now(timezone.utc).isoformat()
 
         log.exception(
-            "[%s] Failed; existing output retained: %s",
+            "[%s] Failed; previous TXT retained: %s",
             region,
             error,
         )
@@ -767,51 +770,71 @@ def process_region(region):
     finally:
         if WRITE_DIAGNOSTICS:
             try:
-                atomic_write_json(
-                    diagnostic_path,
-                    diagnostic,
-                )
+                atomic_write_json(diagnostic_path, diagnostic)
             except Exception:
                 log.exception(
-                    "[%s] Failed to write diagnostics JSON",
+                    "[%s] Could not write diagnostic JSON",
                     region,
                 )
 
     return diagnostic["status"] == "success"
 
 
-# -------------------- Main --------------------
+# ==================== Main ====================
 
 def main():
-    log.info("Regional latency scan started")
-
+    log.info("Regional official CFST HTTPing scan started")
     log.info(
-        "Regions=%s top_n=%d repeats=%d workers=%d",
+        "Regions=%s top_n=%d repeats=%d workers=%d port=%d URL=%s",
         ",".join(REGIONS),
         TOP_N,
         REPEAT_COUNT,
         MAX_WORKERS,
+        HTTPING_PORT,
+        HTTPING_URL,
     )
 
-    successful_regions = 0
+    executable = resolve_cfst_executable()
+
+    # Confirm the executable can be launched.
+    version_check = subprocess.run(
+        [executable, "-v"],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+
+    log.info(
+        "CFST version check: exit=%s stdout=%s stderr=%s",
+        version_check.returncode,
+        (version_check.stdout or "").strip()[:500],
+        (version_check.stderr or "").strip()[:500],
+    )
+
+    successes = 0
 
     for region in REGIONS:
-        if process_region(region):
-            successful_regions += 1
+        if process_region(region, executable):
+            successes += 1
 
     log.info(
         "Finished: %d/%d regions updated",
-        successful_regions,
+        successes,
         len(REGIONS),
     )
 
-    if successful_regions == 0:
+    if successes == 0:
         raise SystemExit(
-            "ERROR: no region produced a valid new output. "
+            "ERROR: no region produced a valid output. "
             "Previous TXT files were retained. Check "
-            "logs/scanner.log and public/data/*.json."
+            "logs/scanner.log, work_cfst/ and public/data/*.json."
         )
 
 
 if __name__ == "__main__":
     main()
+```
