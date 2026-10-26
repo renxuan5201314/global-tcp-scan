@@ -79,6 +79,8 @@ def main():
             print(f"[{region}] updated {target.name}: {len(lines)} entries")
             updated+=1
         except Exception as e: print(f"[{region}] failed; keeping old file: {e}")
-    print(f"Done: updated {updated}/{len(REGIONS)} regions")
+        print(f"Done: updated {updated}/{len(REGIONS)} regions")
+        if updated == 0:
+            raise SystemExit("ERROR: 0 regions updated; check API, CFST output and CSV parsing logs.")
 
 if __name__=="__main__": main()
