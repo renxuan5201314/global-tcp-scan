@@ -1,0 +1,83 @@
+name: Global TCP scan (official CloudflareSpeedTest)
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: global-tcp-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download official CloudflareSpeedTest Linux x86-64 release
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/XIU2/CloudflareSpeedTest/releases/latest"
+          url="$(python - <<'PY'
+          import json, urllib.request
+          req = urllib.request.Request('https://api.github.com/repos/XIU2/CloudflareSpeedTest/releases/latest', headers={'User-Agent':'global-tcp-scan'})
+          with urllib.request.urlopen(req, timeout=30) as r:
+              release = json.load(r)
+          assets = release.get('assets', [])
+          preferred = [a for a in assets if 'linux' in a['name'].lower() and ('amd64' in a['name'].lower() or 'x86_64' in a['name'].lower()) and a['name'].lower().endswith(('.tar.gz', '.tgz', '.zip'))]
+          if not preferred:
+              raise SystemExit('No Linux x86-64 archive found in official CFST latest release. Assets: ' + ', '.join(a['name'] for a in assets))
+          print(preferred[0]['browser_download_url'])
+          PY
+          )"
+          echo "Downloading $url"
+          curl --fail --location --retry 3 "$url" -o /tmp/cfst-release
+          mkdir -p /tmp/cfst-unpack
+          if file /tmp/cfst-release | grep -qi 'gzip compressed'; then tar -xzf /tmp/cfst-release -C /tmp/cfst-unpack
+          elif file /tmp/cfst-release | grep -qi 'Zip archive'; then unzip -q /tmp/cfst-release -d /tmp/cfst-unpack
+          else echo 'Unknown CFST archive format'; file /tmp/cfst-release; exit 1; fi
+          binary="$(find /tmp/cfst-unpack -type f \( -name cfst -o -name CloudflareSpeedTest \) -print -quit)"
+          test -n "$binary" || { echo 'Could not find CFST executable in official archive'; find /tmp/cfst-unpack -maxdepth 3 -type f; exit 1; }
+          install -m 0755 "$binary" ./cfst
+          ./cfst -v || true
+
+      - name: Run all-region scan
+        id: scan
+        env:
+          SOURCE_URL: https://proxy.seeck.cn/api/nodes?region=
+          REGIONS: JP,HK,KR,CN,US,SG,DE
+          TOP_N: "20"
+          PUBLISH_STANDARD_VARIANTS: "true"
+          CFST_BIN: ./cfst
+          CFST_THREADS: "20"
+          CFST_ROUNDS: "4"
+          CFST_TIMEOUT_SECONDS: "3"
+        run: python scanner.py
+
+      - name: Commit updated public results and state
+        if: steps.scan.outputs.publish == 'true'
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public .scan-state.json
+          if git diff --cached --quiet; then
+            echo "No published file changes."
+          else
+            git commit -m "Update CloudflareSpeedTest regional rankings"
+            git push
+          fi
