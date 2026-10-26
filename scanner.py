@@ -91,10 +91,14 @@ def scan(region, endpoints):
             with csvfile.open(encoding="utf-8-sig", newline="") as handle:
                 reader = csv.reader(handle)
                 header = next(reader, [])
-                columns = [re.sub(r"\s+", "", column.strip().lower()) for column in header]
+                columns = [
+                    re.sub(r"\s+", "", column.strip().lower())
+                    for column in header
+                ]
+
                 ip_index = next(
                     (i for i, column in enumerate(columns)
-                     if column in ("ip address", "ip地址", "ip")), None
+                     if column in ("ipaddress", "ip地址", "ip")), None
                 )
                 latency_index = next(
                     (i for i, column in enumerate(columns)
