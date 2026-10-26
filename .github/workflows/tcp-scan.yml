@@ -1,4 +1,4 @@
-```yaml
+
 name: TCP Scan
 
 on:
@@ -99,4 +99,3 @@ jobs:
 
           git commit -m "Update regional TCP scan results"
           git push
-```
