@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -6,17 +5,21 @@ Regional proxy latency scanner.
 
 Features:
 - Fetch nodes from proxy.seeck.cn regional APIs.
-- Use the site's reported responseTime API as the latency source.
+- Measure latency using the site's responseTime API.
+- Require success=True and probe_results.ipv4.ok=True.
 - Test each endpoint 3 times and use the median latency.
 - Keep the best 30 endpoints for each source region.
 - Preserve old TXT files when a scan fails or looks incomplete.
 - Atomic file replacement.
 - Detailed logging and JSON diagnostics.
 
+Latency source:
+    https://api.090227.xyz/check?proxyip=IP:PORT
+
 Important:
-The exact request/response schema of the site's JavaScript API must be
-verified against the original source. This script deliberately does not
-fall back to TCP-connect timing when the API request fails.
+- Does not fall back to local TCP-connect timing.
+- responseTime is the ranking latency.
+- The API's own success and IPv4 probe status must both be successful.
 """
 
 import concurrent.futures
@@ -28,11 +31,9 @@ import os
 import re
 import statistics
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -59,32 +60,27 @@ NODE_API_TIMEOUT = 30
 SPEED_API_TIMEOUT = 30
 
 # Protect old files against suspiciously incomplete scans.
-# A region must have at least this many successful endpoints before
-# replacing its existing output. Set to 1 if small result sets are valid.
 MIN_SUCCESS_RESULTS = 3
-
-# If an existing list has many entries, require a reasonable number
-# of successful results before replacing it.
 MIN_SUCCESS_RATIO = 0.10
 
-USER_AGENT = "regional-proxy-latency-scanner/2.0"
+USER_AGENT = "regional-proxy-latency-scanner/2.1"
 
-# Optional API response keys that may contain the latency result.
-# "responseTime" is the expected key mentioned in the site's JS.
-LATENCY_KEYS = ("responseTime",)
-
-# Only accept plausible, finite, non-negative latency values.
 MAX_ACCEPTABLE_LATENCY_MS = 120000
 
-# If True, save per-endpoint measurements and error diagnostics.
 WRITE_DIAGNOSTICS = True
 
+# Delay between repeated requests to the same endpoint.
+REPEAT_DELAY_SECONDS = 0.15
 
-# -------------------- Logging --------------------
+
+# -------------------- Directory setup --------------------
 
 PUBLIC.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# -------------------- Logging --------------------
 
 log_file = LOG_DIR / "scanner.log"
 
@@ -115,30 +111,40 @@ def http_get_text(url, timeout):
 
     with urllib.request.urlopen(request, timeout=timeout) as response:
         status = getattr(response, "status", 200)
+
         if status < 200 or status >= 300:
             raise RuntimeError(f"HTTP status {status}")
 
         raw = response.read()
         charset = response.headers.get_content_charset() or "utf-8"
+
         return raw.decode(charset, errors="replace")
 
 
 def atomic_write_text(path, content):
     """
-    Write to a temporary file in the same directory, then atomically replace.
-    The previous file remains untouched if writing fails before os.replace().
+    Write a temporary file in the same directory and atomically replace
+    the destination only after the write completes successfully.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(path.name + f".tmp-{os.getpid()}")
+
+    temp_path = path.with_name(
+        path.name + f".tmp-{os.getpid()}-{time.time_ns()}"
+    )
 
     try:
-        with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+        with temp_path.open(
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        ) as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
 
         os.replace(temp_path, path)
+
     finally:
         try:
             temp_path.unlink(missing_ok=True)
@@ -151,8 +157,8 @@ def atomic_write_json(path, data):
         data,
         ensure_ascii=False,
         indent=2,
-        sort_keys=False,
     ) + "\n"
+
     atomic_write_text(path, content)
 
 
@@ -165,7 +171,12 @@ ENDPOINT_PATTERN = re.compile(
 
 def extract_endpoints(text):
     """
-    Extract unique IPv4:port endpoints from JSON or plain-text API responses.
+    Extract unique IPv4:port endpoints from a JSON or plain-text response.
+
+    Note:
+    This uses endpoint-pattern extraction because the precise node JSON
+    schema has not been supplied here. If the source contains unrelated
+    IPv4:port strings, those could also be extracted.
     """
     found = set()
 
@@ -175,9 +186,12 @@ def extract_endpoints(text):
         try:
             ip = str(ipaddress.IPv4Address(ip_text))
             port = int(port_text)
+
             if not 1 <= port <= 65535:
                 continue
+
             found.add((ip, port))
+
         except ValueError:
             continue
 
@@ -191,16 +205,19 @@ def extract_endpoints(text):
 
 
 def fetch_region(region):
+    """Fetch candidates for one source region."""
     url = NODE_API + urllib.parse.quote(region, safe="")
+
     log.info("[%s] Fetching candidates: %s", region, url)
 
     text = http_get_text(url, NODE_API_TIMEOUT)
 
-    # JSON responses are serialized again to make nested endpoint fields
-    # searchable. If the response is not JSON, scan the original text.
     try:
         payload = json.loads(text)
-        searchable_text = json.dumps(payload, ensure_ascii=False)
+        searchable_text = json.dumps(
+            payload,
+            ensure_ascii=False,
+        )
     except json.JSONDecodeError:
         searchable_text = text
 
@@ -208,10 +225,16 @@ def fetch_region(region):
 
     if not endpoints:
         raise RuntimeError(
-            "API returned no valid IPv4:port endpoints; old output retained"
+            "API returned no valid IPv4:port endpoints; "
+            "existing output retained"
         )
 
-    log.info("[%s] Found %d unique endpoints", region, len(endpoints))
+    log.info(
+        "[%s] Found %d unique endpoints",
+        region,
+        len(endpoints),
+    )
+
     return endpoints
 
 
@@ -219,85 +242,113 @@ def fetch_region(region):
 
 def parse_latency_value(value):
     """
-    Parse the site's responseTime value into milliseconds.
+    Parse responseTime into milliseconds.
 
     Numeric values are interpreted as milliseconds.
-    Strings such as '123ms' are accepted.
-    Seconds are NOT inferred from a numeric value; that must be established
-    from the site's source/API contract.
+    Strings such as '123ms' are also accepted.
     """
     if isinstance(value, bool) or value is None:
         raise ValueError("responseTime is missing or invalid")
 
     if isinstance(value, (int, float)):
         latency = float(value)
+
     elif isinstance(value, str):
         cleaned = value.strip().lower()
         cleaned = re.sub(r"\s*ms\s*$", "", cleaned)
         latency = float(cleaned)
+
     else:
         raise ValueError(
-            f"Unsupported responseTime type: {type(value).__name__}"
+            "Unsupported responseTime type: "
+            f"{type(value).__name__}"
         )
 
     if not math.isfinite(latency):
         raise ValueError("responseTime is not finite")
 
     if latency < 0 or latency > MAX_ACCEPTABLE_LATENCY_MS:
-        raise ValueError(f"responseTime out of range: {latency}")
+        raise ValueError(
+            f"responseTime out of range: {latency}"
+        )
 
     return latency
 
 
 def find_response_time(payload):
     """
-    Locate responseTime in common JSON response layouts.
+    Validate the known API response structure.
 
-    This does not invent a latency value. If responseTime is not present,
-    the measurement is considered failed.
+    A response is accepted only if:
+    - payload is a JSON object;
+    - success is exactly True;
+    - probe_results.ipv4 exists;
+    - probe_results.ipv4.ok is exactly True;
+    - responseTime is present and valid.
+
+    The ranking latency comes from responseTime, not local HTTP elapsed time.
     """
-    if isinstance(payload, dict):
-        for key in LATENCY_KEYS:
-            if key in payload:
-                return parse_latency_value(payload[key])
+    if not isinstance(payload, dict):
+        raise ValueError("Latency API response is not a JSON object")
 
-        # Common wrappers sometimes put the actual response inside data/result.
-        # Search only these explicit wrapper objects.
-        for wrapper_key in ("data", "result"):
-            nested = payload.get(wrapper_key)
-            if isinstance(nested, dict):
-                for key in LATENCY_KEYS:
-                    if key in nested:
-                        return parse_latency_value(nested[key])
+    if payload.get("success") is not True:
+        raise ValueError(
+            "Latency API did not report success=True; "
+            f"received {payload.get('success')!r}"
+        )
 
-    raise ValueError(
-        "Could not find responseTime in API JSON; "
-        "verify the exact response structure against the site's JavaScript"
-    )
+    probe_results = payload.get("probe_results")
+
+    if not isinstance(probe_results, dict):
+        raise ValueError("Missing or invalid probe_results")
+
+    ipv4_result = probe_results.get("ipv4")
+
+    if not isinstance(ipv4_result, dict):
+        raise ValueError("Missing or invalid probe_results.ipv4")
+
+    if ipv4_result.get("ok") is not True:
+        raise ValueError(
+            "IPv4 probe failed; "
+            f"error={ipv4_result.get('error')!r}"
+        )
+
+    if "responseTime" not in payload:
+        raise ValueError("Missing responseTime")
+
+    return parse_latency_value(payload["responseTime"])
 
 
 def probe_once(ip, port):
     """
-    Make one request to the site's latency API for an endpoint.
+    Ask the site's latency API to measure one endpoint.
 
-    The endpoint is passed as the proxyip query parameter.
-    The API URL and query format must be checked against the original JS.
+    Local API request duration is recorded for diagnostics only.
+    It is never used as the endpoint ranking latency.
     """
     endpoint = f"{ip}:{port}"
-    query = urllib.parse.urlencode({"proxyip": endpoint})
-    url = f"{SPEED_API}{query}"
 
+    query = urllib.parse.urlencode({
+        "proxyip": endpoint,
+    })
+
+    url = f"{SPEED_API}{query}"
     started = time.perf_counter()
 
     try:
         text = http_get_text(url, SPEED_API_TIMEOUT)
-        elapsed_ms = (time.perf_counter() - started) * 1000
+
+        elapsed_ms = (
+            time.perf_counter() - started
+        ) * 1000
 
         try:
             payload = json.loads(text)
+
         except json.JSONDecodeError as error:
             raise ValueError(
-                f"Latency API returned non-JSON content: {text[:200]!r}"
+                "Latency API returned non-JSON content: "
+                f"{text[:200]!r}"
             ) from error
 
         latency_ms = find_response_time(payload)
@@ -306,15 +357,28 @@ def probe_once(ip, port):
             "ok": True,
             "latency_ms": latency_ms,
             "api_elapsed_ms": round(elapsed_ms, 2),
+            "api_success": payload.get("success"),
+            "ipv4_probe_ok": (
+                payload.get("probe_results", {})
+                .get("ipv4", {})
+                .get("ok")
+            ),
+            "colo": payload.get("colo"),
             "error": None,
         }
 
     except Exception as error:
-        elapsed_ms = (time.perf_counter() - started) * 1000
+        elapsed_ms = (
+            time.perf_counter() - started
+        ) * 1000
+
         return {
             "ok": False,
             "latency_ms": None,
             "api_elapsed_ms": round(elapsed_ms, 2),
+            "api_success": None,
+            "ipv4_probe_ok": None,
+            "colo": None,
             "error": f"{type(error).__name__}: {error}",
         }
 
@@ -323,15 +387,25 @@ def probe_endpoint(ip, port):
     """
     Test an endpoint REPEAT_COUNT times.
 
-    The ranking latency is the median of successful responseTime readings.
-    An endpoint is accepted only if all three measurements succeed, to avoid
-    ranking unstable or partially measured endpoints as if fully verified.
+    All attempts must succeed. The median responseTime is used for ranking.
     """
     measurements = []
+    attempts = []
     errors = []
 
     for attempt in range(1, REPEAT_COUNT + 1):
         result = probe_once(ip, port)
+
+        attempts.append({
+            "attempt": attempt,
+            "ok": result["ok"],
+            "latency_ms": result["latency_ms"],
+            "api_elapsed_ms": result["api_elapsed_ms"],
+            "api_success": result["api_success"],
+            "ipv4_probe_ok": result["ipv4_probe_ok"],
+            "colo": result["colo"],
+            "error": result["error"],
+        })
 
         if result["ok"]:
             measurements.append(result["latency_ms"])
@@ -341,9 +415,8 @@ def probe_endpoint(ip, port):
                 "error": result["error"],
             })
 
-        # Small pause between requests to reduce accidental burst pressure.
         if attempt < REPEAT_COUNT:
-            time.sleep(0.15)
+            time.sleep(REPEAT_DELAY_SECONDS)
 
     complete = len(measurements) == REPEAT_COUNT
 
@@ -353,6 +426,7 @@ def probe_endpoint(ip, port):
         "endpoint": f"{ip}:{port}",
         "attempts_requested": REPEAT_COUNT,
         "attempts_succeeded": len(measurements),
+        "attempts": attempts,
         "measurements_ms": measurements,
         "errors": errors,
         "complete": complete,
@@ -362,10 +436,14 @@ def probe_endpoint(ip, port):
             else None
         ),
         "minimum_ms": (
-            round(min(measurements), 2) if complete else None
+            round(min(measurements), 2)
+            if complete
+            else None
         ),
         "maximum_ms": (
-            round(max(measurements), 2) if complete else None
+            round(max(measurements), 2)
+            if complete
+            else None
         ),
         "spread_ms": (
             round(max(measurements) - min(measurements), 2)
@@ -380,6 +458,7 @@ def probe_endpoint(ip, port):
 # -------------------- Region scanning --------------------
 
 def scan_region(region, endpoints):
+    """Measure all endpoints in a region concurrently."""
     started = time.monotonic()
     records = []
 
@@ -394,6 +473,7 @@ def scan_region(region, endpoints):
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=MAX_WORKERS
     ) as executor:
+
         future_to_endpoint = {
             executor.submit(probe_endpoint, ip, port): (ip, port)
             for ip, port in endpoints
@@ -402,12 +482,15 @@ def scan_region(region, endpoints):
         completed = 0
         total = len(future_to_endpoint)
 
-        for future in concurrent.futures.as_completed(future_to_endpoint):
+        for future in concurrent.futures.as_completed(
+            future_to_endpoint
+        ):
             ip, port = future_to_endpoint[future]
             completed += 1
 
             try:
                 record = future.result()
+
             except Exception as error:
                 record = {
                     "ip": ip,
@@ -415,10 +498,11 @@ def scan_region(region, endpoints):
                     "endpoint": f"{ip}:{port}",
                     "attempts_requested": REPEAT_COUNT,
                     "attempts_succeeded": 0,
+                    "attempts": [],
                     "measurements_ms": [],
-                    "errors": [
-                        {"error": f"Unhandled exception: {error}"}
-                    ],
+                    "errors": [{
+                        "error": f"Unhandled exception: {error}",
+                    }],
                     "complete": False,
                     "latency_ms": None,
                     "minimum_ms": None,
@@ -450,11 +534,16 @@ def scan_region(region, endpoints):
                     REPEAT_COUNT,
                 )
 
-    successful = [r for r in records if r["complete"]]
+    successful = [
+        record for record in records
+        if record["complete"]
+    ]
+
     elapsed = round(time.monotonic() - started, 2)
 
     log.info(
-        "[%s] Scan finished: candidates=%d complete=%d incomplete=%d elapsed=%.2fs",
+        "[%s] Scan finished: candidates=%d complete=%d "
+        "incomplete=%d elapsed=%.2fs",
         region,
         len(endpoints),
         len(successful),
@@ -469,13 +558,15 @@ def scan_region(region, endpoints):
 
 def validate_results(region, endpoints, records, target):
     """
-    Refuse to replace an existing file when results appear incomplete.
-
-    This is a safety threshold, not proof that the remote service measured
-    every endpoint correctly.
+    Refuse to replace an existing output when results appear incomplete.
     """
     candidate_count = len(endpoints)
-    success_records = [r for r in records if r.get("complete")]
+
+    success_records = [
+        record for record in records
+        if record.get("complete")
+    ]
+
     success_count = len(success_records)
 
     if candidate_count == 0:
@@ -491,27 +582,31 @@ def validate_results(region, endpoints, records, target):
 
     if target.is_file() and target.stat().st_size > 0:
         old_lines = [
-            line for line in target.read_text(
-                encoding="utf-8", errors="replace"
+            line
+            for line in target.read_text(
+                encoding="utf-8",
+                errors="replace",
             ).splitlines()
             if line.strip()
         ]
 
-        # If a previous list had many entries, reject a dramatically smaller
-        # scan unless the current scan has a reasonable success ratio.
-        if len(old_lines) >= TOP_N and success_ratio < MIN_SUCCESS_RATIO:
+        if (
+            len(old_lines) >= TOP_N
+            and success_ratio < MIN_SUCCESS_RATIO
+        ):
             raise RuntimeError(
-                f"Suspiciously low success ratio {success_ratio:.1%}; "
-                "existing output retained"
+                f"Suspiciously low success ratio "
+                f"{success_ratio:.1%}; existing output retained"
             )
 
     if not success_records:
         raise RuntimeError("No complete latency records")
 
-    # Ensure all output endpoints were among the discovered candidates.
     candidate_set = set(endpoints)
+
     for record in success_records:
         key = (record["ip"], record["port"])
+
         if key not in candidate_set:
             raise RuntimeError(
                 f"Unexpected endpoint in results: {record['endpoint']}"
@@ -520,21 +615,29 @@ def validate_results(region, endpoints, records, target):
     return success_records, success_ratio
 
 
+# -------------------- TXT generation --------------------
+
 def build_txt(region, best):
+    """
+    Build subscription-compatible TXT lines.
+
+    Example:
+        129.154.212.204:443#JP-01-133ms
+    """
     lines = []
 
     for rank, record in enumerate(best, start=1):
         latency = record["latency_ms"]
-        ip = record["ip"]
-        port = record["port"]
 
-        # Preserve the original subscription-compatible line format.
         lines.append(
-            f"{ip}:{port}#{region}-{rank:02d}-{latency:.0f}ms"
+            f"{record['ip']}:{record['port']}"
+            f"#{region}-{rank:02d}-{latency:.0f}ms"
         )
 
     return "\n".join(lines) + "\n"
 
+
+# -------------------- Region processing --------------------
 
 def process_region(region):
     target = PUBLIC / f"{region.lower()}.txt"
@@ -562,56 +665,84 @@ def process_region(region):
 
     try:
         endpoints = fetch_region(region)
+
         diagnostic["candidate_count"] = len(endpoints)
 
         records = scan_region(region, endpoints)
+
         diagnostic["complete_count"] = sum(
-            1 for record in records if record["complete"]
+            1 for record in records
+            if record["complete"]
         )
+
         diagnostic["incomplete_count"] = (
             len(records) - diagnostic["complete_count"]
         )
+
         diagnostic["results"] = records
 
         successful, success_ratio = validate_results(
-            region, endpoints, records, target
+            region,
+            endpoints,
+            records,
+            target,
         )
-        diagnostic["success_ratio"] = round(success_ratio, 4)
+
+        diagnostic["success_ratio"] = round(
+            success_ratio,
+            4,
+        )
 
         best = sorted(
             successful,
             key=lambda record: (
                 record["latency_ms"],
                 record["spread_ms"],
-                tuple(int(part) for part in record["ip"].split(".")),
+                tuple(
+                    int(part)
+                    for part in record["ip"].split(".")
+                ),
                 record["port"],
             ),
         )[:TOP_N]
 
         if not best:
-            raise RuntimeError("No ranked results after validation")
+            raise RuntimeError(
+                "No ranked results after validation"
+            )
 
         content = build_txt(region, best)
 
-        # Validate the complete content before replacing the previous file.
-        lines = [line for line in content.splitlines() if line.strip()]
+        # Validate generated TXT content before replacing the old file.
+        lines = [
+            line for line in content.splitlines()
+            if line.strip()
+        ]
+
         if not lines:
             raise RuntimeError("Generated TXT content is empty")
 
         for line in lines:
             if "#" not in line or ":" not in line:
-                raise RuntimeError(f"Malformed output line: {line!r}")
+                raise RuntimeError(
+                    f"Malformed output line: {line!r}"
+                )
 
-        # Atomic replacement: old file remains intact if writing fails.
+        # Existing TXT is replaced only after all checks pass.
         atomic_write_text(target, content)
 
         diagnostic["status"] = "success"
         diagnostic["output_count"] = len(lines)
-        diagnostic["output_file"] = str(target.relative_to(ROOT))
-        diagnostic["finished_at"] = datetime.now(timezone.utc).isoformat()
+        diagnostic["output_file"] = str(
+            target.relative_to(ROOT)
+        )
+        diagnostic["finished_at"] = (
+            datetime.now(timezone.utc).isoformat()
+        )
 
         log.info(
-            "[%s] Updated %s with %d entries (success ratio %.1f%%)",
+            "[%s] Updated %s with %d entries "
+            "(success ratio %.1f%%)",
             region,
             target.name,
             len(lines),
@@ -620,8 +751,12 @@ def process_region(region):
 
     except Exception as error:
         diagnostic["status"] = "failed"
-        diagnostic["error"] = f"{type(error).__name__}: {error}"
-        diagnostic["finished_at"] = datetime.now(timezone.utc).isoformat()
+        diagnostic["error"] = (
+            f"{type(error).__name__}: {error}"
+        )
+        diagnostic["finished_at"] = (
+            datetime.now(timezone.utc).isoformat()
+        )
 
         log.exception(
             "[%s] Failed; existing output retained: %s",
@@ -632,7 +767,10 @@ def process_region(region):
     finally:
         if WRITE_DIAGNOSTICS:
             try:
-                atomic_write_json(diagnostic_path, diagnostic)
+                atomic_write_json(
+                    diagnostic_path,
+                    diagnostic,
+                )
             except Exception:
                 log.exception(
                     "[%s] Failed to write diagnostics JSON",
@@ -646,6 +784,7 @@ def process_region(region):
 
 def main():
     log.info("Regional latency scan started")
+
     log.info(
         "Regions=%s top_n=%d repeats=%d workers=%d",
         ",".join(REGIONS),
@@ -669,8 +808,8 @@ def main():
     if successful_regions == 0:
         raise SystemExit(
             "ERROR: no region produced a valid new output. "
-            "Previous TXT files were retained. Check logs/scanner.log "
-            "and public/data/*.json."
+            "Previous TXT files were retained. Check "
+            "logs/scanner.log and public/data/*.json."
         )
 
 
