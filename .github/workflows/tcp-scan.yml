@@ -1,4 +1,3 @@
-
 name: TCP Scan
 
 on:
@@ -29,6 +28,7 @@ jobs:
 
       - name: Install Python dependencies
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             python -m pip install -r requirements.txt
@@ -48,7 +48,6 @@ jobs:
 
           echo "===== Archive contents ====="
           tar -tzf "$ARCHIVE"
-
           tar -xzf "$ARCHIVE" -C "$EXTRACT_DIR"
 
           echo "===== Extracted files ====="
@@ -59,13 +58,12 @@ jobs:
             -print -quit)"
 
           if [ -z "$BIN" ]; then
-            echo "::error::未在压缩包中找到可执行文件。请检查上面的 Archive contents 和 Extracted files。"
+            echo "::error::未在压缩包中找到 CFST 可执行文件。"
             exit 1
           fi
 
           install -m 755 "$BIN" "$GITHUB_WORKSPACE/cfst"
 
-          echo "===== Verify binary ====="
           file "$GITHUB_WORKSPACE/cfst"
           "$GITHUB_WORKSPACE/cfst" -v || true
 
@@ -75,6 +73,41 @@ jobs:
           set -euo pipefail
           python scanner.py
 
+      - name: Keep only seven regional TXT files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p public
+
+          # 只允许这七个地区文件存在于 public/
+          for region in jp hk kr cn us sg de; do
+            if [ ! -s "public/${region}.txt" ]; then
+              echo "::error::public/${region}.txt 不存在或为空，停止清理和提交。"
+              exit 1
+            fi
+          done
+
+          # 删除 public/ 下所有其他文件和目录。
+          find public -mindepth 1 -maxdepth 1 \
+            ! -name 'jp.txt' \
+            ! -name 'hk.txt' \
+            ! -name 'kr.txt' \
+            ! -name 'cn.txt' \
+            ! -name 'us.txt' \
+            ! -name 'sg.txt' \
+            ! -name 'de.txt' \
+            -exec rm -rf -- {} +
+
+          echo "===== Final public directory ====="
+          find public -mindepth 1 -maxdepth 1 -printf '%f\n' | sort
+
+          COUNT="$(find public -mindepth 1 -maxdepth 1 -type f -name '*.txt' | wc -l)"
+          if [ "$COUNT" -ne 7 ]; then
+            echo "::error::public/ 最终 TXT 文件数量不是 7。"
+            exit 1
+          fi
+
       - name: Commit regional results
         shell: bash
         run: |
@@ -83,14 +116,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add -- \
-            public/jp.txt \
-            public/hk.txt \
-            public/kr.txt \
-            public/cn.txt \
-            public/us.txt \
-            public/sg.txt \
-            public/de.txt
+          # 同时暂存七个结果文件和旧文件的删除记录。
+          git add -A -- public/
 
           if git diff --cached --quiet; then
             echo "没有文件变化，无需提交。"
