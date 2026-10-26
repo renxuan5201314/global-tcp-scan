@@ -42,7 +42,7 @@ REGIONS = ("JP", "HK", "KR", "CN", "US", "SG", "DE")
 NODE_API = "https://proxy.seeck.cn/api/nodes?region="
 USER_AGENT = "regional-cfst-httping-scanner/3.0"
 
-TOP_N = 30
+TOP_N = 100
 REPEAT_COUNT = 3
 MAX_WORKERS = 10
 
