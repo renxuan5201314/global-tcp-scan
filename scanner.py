@@ -1,6 +1,7 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Use the official XIU2/CloudflareSpeedTest binary to scan regional IP:port candidates."""
+"""Regional HTTPS latency scanner using official CloudflareSpeedTest."""
 
 import concurrent.futures
 import csv
@@ -12,20 +13,32 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-REGIONS = [x.strip().upper() for x in os.getenv("REGIONS", "JP,HK,KR,CN,US,SG,DE").split(",") if x.strip()]
-SOURCE_URL = os.getenv("SOURCE_URL", "https://proxy.seeck.cn/api/nodes?region=")
+REGIONS = [
+    x.strip().upper()
+    for x in os.getenv("REGIONS", "JP,HK,KR,CN,US,SG,DE").split(",")
+    if x.strip()
+]
+SOURCE_URL = os.getenv(
+    "SOURCE_URL", "https://proxy.seeck.cn/api/nodes?region="
+)
 TOP_N = max(1, min(int(os.getenv("TOP_N", "20")), 500))
-# Also publish fixed convenience endpoints: top 30, top 100, and all successful candidates.
-PUBLISH_STANDARD_VARIANTS = os.getenv("PUBLISH_STANDARD_VARIANTS", "true").lower() in ("1", "true", "yes", "on")
+PUBLISH_STANDARD_VARIANTS = os.getenv(
+    "PUBLISH_STANDARD_VARIANTS", "true"
+).lower() in ("1", "true", "yes", "on")
 CFST_BIN = os.getenv("CFST_BIN", "./cfst")
 CFST_THREADS = max(1, min(int(os.getenv("CFST_THREADS", "20")), 1000))
 CFST_ROUNDS = max(1, min(int(os.getenv("CFST_ROUNDS", "4")), 20))
-CFST_TIMEOUT_SECONDS = max(1, min(int(os.getenv("CFST_TIMEOUT_SECONDS", "3")), 30))
+CFST_TIMEOUT_SECONDS = max(
+    1, min(int(os.getenv("CFST_TIMEOUT_SECONDS", "3")), 30)
+)
+CFST_URL = os.getenv(
+    "CFST_URL", "https://www.youtube.com/generate_204"
+)
+CFST_HTTPING_CODE = os.getenv("CFST_HTTPING_CODE", "204")
 OUT = Path("public")
 DATA = OUT / "data"
 STATE_FILE = Path(".scan-state.json")
@@ -61,13 +74,22 @@ def should_scan(state):
     except (ValueError, TypeError):
         return True
     if elapsed < INTERVAL_SECONDS:
-        print(f"Skipping scan: {INTERVAL_SECONDS - elapsed:.0f}s remain before next round.")
+        print(
+            f"Skipping scan: {INTERVAL_SECONDS - elapsed:.0f}s remain "
+            "before next round."
+        )
         return False
     return True
 
 
 def fetch_payload(url):
-    request = urllib.request.Request(url, headers={"User-Agent": "global-tcp-scan/2.0", "Accept": "application/json, text/plain, */*"})
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "global-tcp-scan/3.0",
+            "Accept": "application/json, text/plain, */*",
+        },
+    )
     try:
         with urllib.request.urlopen(request, timeout=25) as response:
             raw = response.read()
@@ -76,13 +98,18 @@ def fetch_payload(url):
     except urllib.error.HTTPError as exc:
         body = exc.read(300).decode("utf-8", errors="replace")
         raise RuntimeError(f"source HTTP {exc.code}: {body}") from exc
+
     text = raw.decode("utf-8-sig", errors="replace").strip()
     if not text:
         raise ValueError(f"empty source response: {final_url}")
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
-        payload = [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+        payload = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
     print(f"Source HTTP {status}, {len(raw)} bytes: {final_url}")
     return payload, len(raw)
 
@@ -96,20 +123,26 @@ def parse_endpoint(item):
         elif value.count(":") == 1:
             ip, port = value.rsplit(":", 1)
     elif isinstance(item, dict):
-        ip = item.get("ip") or item.get("host") or item.get("address") or item.get("server")
+        ip = (
+            item.get("ip")
+            or item.get("host")
+            or item.get("address")
+            or item.get("server")
+        )
         port = item.get("port")
         if ip and port is None and isinstance(ip, str) and ip.count(":") == 1:
             ip, port = ip.rsplit(":", 1)
+
     if not ip or port is None:
         return None
     try:
-        ip = str(ipaddress.ip_address(str(ip).strip()))
-        # Current CFST workflow targets IPv4 candidates; do not silently feed IPv6 into this adapter.
-        if ipaddress.ip_address(ip).version != 4:
+        parsed_ip = ipaddress.ip_address(str(ip).strip())
+        if parsed_ip.version != 4:
             return None
         port = int(port)
         if not 1 <= port <= 65535:
             return None
+        ip = str(parsed_ip)
         return {"ip": ip, "port": port, "address": f"{ip}:{port}"}
     except (ValueError, TypeError):
         return None
@@ -119,32 +152,57 @@ def candidates_from(payload):
     if isinstance(payload, list):
         raw = payload
     elif isinstance(payload, dict):
-        keys = ("nodes", "data", "list", "results", "items", "proxies", "servers", "ips")
-        raw = next((payload.get(k) for k in keys if isinstance(payload.get(k), list)), None)
+        keys = (
+            "nodes", "data", "list", "results", "items",
+            "proxies", "servers", "ips",
+        )
+        raw = next(
+            (payload.get(k) for k in keys if isinstance(payload.get(k), list)),
+            None,
+        )
         if raw is None:
             for parent_key in ("data", "result", "response"):
                 parent = payload.get(parent_key)
                 if isinstance(parent, dict):
-                    raw = next((parent.get(k) for k in keys if isinstance(parent.get(k), list)), None)
+                    raw = next(
+                        (
+                            parent.get(k)
+                            for k in keys
+                            if isinstance(parent.get(k), list)
+                        ),
+                        None,
+                    )
                     if raw is not None:
                         break
         if raw is None:
-            raw = next((v for v in payload.values() if isinstance(v, list)), None)
+            raw = next(
+                (v for v in payload.values() if isinstance(v, list)), None
+            )
         if raw is None:
-            raise ValueError(f"JSON has no recognizable node list; keys={list(payload)[:25]}")
+            raise ValueError(
+                f"JSON has no recognizable node list; keys={list(payload)[:25]}"
+            )
     else:
         raise ValueError(f"unsupported source payload: {type(payload).__name__}")
 
     found, seen = [], set()
     for item in raw:
-        parts = item.split() if isinstance(item, str) and any(c.isspace() for c in item.strip()) else [item]
+        parts = (
+            item.split()
+            if isinstance(item, str) and any(c.isspace() for c in item.strip())
+            else [item]
+        )
         for part in parts:
             node = parse_endpoint(part)
             if node and node["address"] not in seen:
                 seen.add(node["address"])
                 found.append(node)
+
     if not found:
-        raise ValueError("source yielded no valid IPv4:port candidates (CFST adapter requires IPv4)")
+        raise ValueError(
+            "source yielded no valid IPv4:port candidates "
+            "(CFST adapter requires IPv4)"
+        )
     return found
 
 
@@ -156,28 +214,58 @@ def find_csv_value(row, needles):
 
 
 def run_cfst_group(port, nodes, workdir):
-    """Run the official CFST binary for one port; return address -> latency(ms)."""
+    """Run HTTPing against the target URL for one candidate port."""
     ip_file = workdir / f"ips-{port}.txt"
     csv_file = workdir / f"result-{port}.csv"
-    # CFST accepts an IP list, and -tp applies the chosen port to every IP in this run.
-    ip_file.write_text("\n".join(n["ip"] for n in nodes) + "\n", encoding="ascii")
+    ip_file.write_text(
+        "\n".join(node["ip"] for node in nodes) + "\n",
+        encoding="ascii",
+    )
+
     command = [
-        CFST_BIN, "-f", str(ip_file), "-tp", str(port), "-t", str(CFST_ROUNDS),
-        "-n", str(min(CFST_THREADS, max(1, len(nodes)))), "-tl", "9999", "-tlr", "1",
-        "-p", "0", "-o", str(csv_file), "-dd",
+        CFST_BIN,
+        "-f", str(ip_file),
+        "-tp", str(port),
+        "-t", str(CFST_ROUNDS),
+        "-n", str(min(CFST_THREADS, max(1, len(nodes)))),
+        "-tl", "9999",
+        "-tlr", "1",
+        "-httping",
+        "-url", CFST_URL,
+        "-httping-code", CFST_HTTPING_CODE,
+        "-p", "0",
+        "-o", str(csv_file),
+        "-dd",
     ]
-    print(f"CFST port={port}, candidates={len(nodes)}: {' '.join(command)}")
+    print(
+        f"CFST HTTPS HTTPing port={port}, candidates={len(nodes)}: "
+        f"{' '.join(command)}"
+    )
+
+    timeout = max(
+        60, len(nodes) * CFST_TIMEOUT_SECONDS + 90
+    )
     try:
-        proc = subprocess.run(command, cwd=Path.cwd(), capture_output=True, text=True, timeout=max(60, len(nodes) * CFST_TIMEOUT_SECONDS + 90))
+        proc = subprocess.run(
+            command,
+            cwd=Path.cwd(),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"CFST timed out on port {port}") from exc
+
     if proc.stdout:
         print(proc.stdout[-4000:])
     if proc.stderr:
         print(proc.stderr[-2000:], file=sys.stderr)
+
     if not csv_file.exists() or csv_file.stat().st_size == 0:
         if proc.returncode != 0:
-            raise RuntimeError(f"CFST exit={proc.returncode}, no CSV for port {port}")
+            raise RuntimeError(
+                f"CFST exit={proc.returncode}, no CSV for port {port}"
+            )
         print(f"CFST produced no results for port {port}")
         return {}
 
@@ -186,20 +274,29 @@ def run_cfst_group(port, nodes, workdir):
         reader = csv.DictReader(stream)
         for row in reader:
             ip = find_csv_value(row, ("ip 地址", "ip address", "ip"))
-            latency = find_csv_value(row, ("平均延迟", "average latency", "latency"))
+            latency = find_csv_value(
+                row, ("平均延迟", "average latency", "latency")
+            )
             if not ip or not latency:
                 continue
             try:
                 ip = str(ip).strip()
-                ms = float(str(latency).strip().lower().replace("ms", ""))
+                ms = float(
+                    str(latency).strip().lower().replace("ms", "")
+                )
                 ipaddress.IPv4Address(ip)
-                if ms >= 0 and ms < 9999:
+                if 0 <= ms < 9999:
                     results[f"{ip}:{port}"] = round(ms, 2)
             except (ValueError, TypeError):
                 continue
+
     if proc.returncode != 0 and not results:
-        raise RuntimeError(f"CFST failed on port {port}, exit={proc.returncode}")
-    print(f"CFST port={port}: parsed {len(results)} successful results")
+        raise RuntimeError(
+            f"CFST failed on port {port}, exit={proc.returncode}"
+        )
+    print(
+        f"CFST port={port}: parsed {len(results)} successful HTTPing results"
+    )
     return results
 
 
@@ -207,6 +304,7 @@ def scan_region(candidates):
     grouped = {}
     for node in candidates:
         grouped.setdefault(node["port"], []).append(node)
+
     results = {}
     with tempfile.TemporaryDirectory(prefix="cfst-") as temp:
         workdir = Path(temp)
@@ -214,25 +312,48 @@ def scan_region(candidates):
             try:
                 results.update(run_cfst_group(port, nodes, workdir))
             except Exception as exc:
-                # Other port groups may still succeed; an all-groups failure is handled by caller.
-                print(f"WARNING: port group {port} failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+                print(
+                    f"WARNING: port group {port} failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
     return results
 
 
 def write_region(region, candidates, latencies, source_bytes):
-    """Publish default TOP_N plus stable convenience files for top 30, top 100 and all."""
     if not latencies:
-        print(f"{region}: no successful CFST results; keeping old TXT/JSON unchanged.")
+        print(
+            f"{region}: no successful HTTPS results; "
+            "keeping old TXT/JSON unchanged."
+        )
         return False
+
     by_address = {node["address"]: node for node in candidates}
     all_nodes = []
     for address, latency in latencies.items():
         node = by_address.get(address)
         if node:
-            all_nodes.append({"ip": node["ip"], "port": node["port"], "latencyMs": latency, "testedAt": iso_now()})
-    all_nodes.sort(key=lambda n: (float(n["latencyMs"]), n["ip"], int(n["port"])))
+            all_nodes.append(
+                {
+                    "ip": node["ip"],
+                    "port": node["port"],
+                    "latencyMs": latency,
+                    "testedAt": iso_now(),
+                }
+            )
+
+    all_nodes.sort(
+        key=lambda node: (
+            float(node["latencyMs"]),
+            node["ip"],
+            int(node["port"]),
+        )
+    )
     if not all_nodes:
-        print(f"{region}: CFST results did not match source candidates; keeping old files.")
+        print(
+            f"{region}: CFST results did not match source candidates; "
+            "keeping old files."
+        )
         return False
 
     OUT.mkdir(parents=True, exist_ok=True)
@@ -241,13 +362,14 @@ def write_region(region, candidates, latencies, source_bytes):
 
     def make_lines(items, limit=None):
         selected = items if limit is None else items[:limit]
-        return ("\n".join(
-            f'{n["ip"]}:{n["port"]}#{region}-{i:02d}-{max(0, round(float(n["latencyMs"])))}ms'
-            for i, n in enumerate(selected, 1)
-        ) + "\n").encode("utf-8") if selected else b""
+        return (
+            "\n".join(
+                f'{node["ip"]}:{node["port"]}#{region}-{i:02d}-'
+                f'{max(0, round(float(node["latencyMs"])))}ms'
+                for i, node in enumerate(selected, 1)
+            ) + "\n"
+        ).encode("utf-8") if selected else b""
 
-    # Default URL: /kr.txt (20 by default; configurable with TOP_N).
-    # Convenience URLs: /kr-.txt (top 30), /kr-top100.txt, /kr-all.txt.
     outputs = {f"{region_l}.txt": make_lines(all_nodes, TOP_N)}
     if PUBLISH_STANDARD_VARIANTS:
         outputs[f"{region_l}-.txt"] = make_lines(all_nodes, 30)
@@ -255,12 +377,22 @@ def write_region(region, candidates, latencies, source_bytes):
         outputs[f"{region_l}-all.txt"] = make_lines(all_nodes)
 
     record = {
-        "region": region, "source": "official-XIU2-CloudflareSpeedTest", "protocol": "TCPing",
-        "updatedAt": iso_now(), "candidateCount": len(candidates), "sourceBytes": source_bytes,
-        "testedCount": len(candidates), "successCount": len(all_nodes), "failedCount": max(0, len(candidates) - len(all_nodes)),
-        "cfstRounds": CFST_ROUNDS, "defaultTopN": TOP_N, "nodes": all_nodes,
+        "region": region,
+        "source": "official-XIU2-CloudflareSpeedTest",
+        "protocol": "HTTPS-HTTPing",
+        "testUrl": CFST_URL,
+        "acceptedHttpStatus": CFST_HTTPING_CODE,
+        "updatedAt": iso_now(),
+        "candidateCount": len(candidates),
+        "sourceBytes": source_bytes,
+        "testedCount": len(candidates),
+        "successCount": len(all_nodes),
+        "failedCount": max(0, len(candidates) - len(all_nodes)),
+        "cfstRounds": CFST_ROUNDS,
+        "defaultTopN": TOP_N,
+        "nodes": all_nodes,
     }
-    # Write temporary files first, then replace only after every output was generated successfully.
+
     pending = []
     try:
         for name, content in outputs.items():
@@ -268,23 +400,66 @@ def write_region(region, candidates, latencies, source_bytes):
             tmp.write_bytes(content)
             pending.append((tmp, OUT / name))
         json_tmp = DATA / f"{region_l}.json.tmp"
-        json_tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        json_tmp.write_text(
+            json.dumps(record, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         pending.append((json_tmp, DATA / f"{region_l}.json"))
         for tmp, target in pending:
             tmp.replace(target)
     except Exception:
         for tmp, _ in pending:
-            try: tmp.unlink(missing_ok=True)
-            except OSError: pass
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
         raise
-    print(f"{region}: candidates={len(candidates)}, successes={len(all_nodes)}, default_published={min(TOP_N, len(all_nodes))}, top30={min(30, len(all_nodes))}, top100={min(100, len(all_nodes))}, all={len(all_nodes)}")
+
+    print(
+        f"{region}: candidates={len(candidates)}, successes={len(all_nodes)}, "
+        f"default_published={min(TOP_N, len(all_nodes))}, "
+        f"top30={min(30, len(all_nodes))}, "
+        f"top100={min(100, len(all_nodes))}, all={len(all_nodes)}"
+    )
     return True
 
 
 def build_index():
-    names = {"JP":"Japan", "HK":"Hong Kong", "KR":"South Korea", "CN":"China", "US":"United States", "SG":"Singapore", "DE":"Germany"}
-    links = "\n".join(f'<li><strong>{r} — {names.get(r,r)}:</strong> <a href="{r.lower()}.txt">default top {TOP_N}</a> | <a href="{r.lower()}-.txt">top 30</a> | <a href="{r.lower()}-top100.txt">top 100</a> | <a href="{r.lower()}-all.txt">all</a> | <a href="data/{r.lower()}.json">JSON</a></li>' for r in REGIONS)
-    html = f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Global TCP latency results</title></head><body><h1>Global TCP latency results</h1><p>Latency measured by the official XIU2/CloudflareSpeedTest TCPing mode from GitHub Actions. Results may differ from tests run on your own network.</p><ul>{links}</ul><p>All source candidates are tested each round, grouped by their original port. Up to {TOP_N} lowest-latency endpoints are published per region. If a region has no successful results, its previous TXT/JSON files are retained.</p></body></html>'''
+    names = {
+        "JP": "Japan",
+        "HK": "Hong Kong",
+        "KR": "South Korea",
+        "CN": "China",
+        "US": "United States",
+        "SG": "Singapore",
+        "DE": "Germany",
+    }
+    links = "\n".join(
+        f'<li><strong>{region} — {names.get(region, region)}:</strong> '
+        f'<a href="{region.lower()}.txt">default top {TOP_N}</a> | '
+        f'<a href="{region.lower()}-.txt">top 30</a> | '
+        f'<a href="{region.lower()}-top100.txt">top 100</a> | '
+        f'<a href="{region.lower()}-all.txt">all</a> | '
+        f'<a href="data/{region.lower()}.json">JSON</a></li>'
+        for region in REGIONS
+    )
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Global YouTube HTTPS latency results</title>
+</head>
+<body>
+<h1>Global YouTube HTTPS latency results</h1>
+<p>Target: {CFST_URL}; accepted HTTP status: {CFST_HTTPING_CODE}.
+Latency is measured from GitHub Actions and may differ from your own network.</p>
+<ul>{links}</ul>
+<p>Each candidate IP is tested with official CloudflareSpeedTest HTTPing.
+This is not a test through a V2RayN proxy. If a region has no successful
+results, its previous TXT/JSON files are retained.</p>
+</body>
+</html>"""
     (OUT / "index.html").write_text(html + "\n", encoding="utf-8")
 
 
@@ -298,41 +473,77 @@ def set_output(name, value):
 def main():
     if not REGIONS:
         raise RuntimeError("REGIONS is empty")
+
     binary = Path(CFST_BIN)
     if not binary.exists() and shutil.which(CFST_BIN) is None:
-        raise FileNotFoundError(f"CloudflareSpeedTest binary not found: {CFST_BIN}")
-    OUT.mkdir(parents=True, exist_ok=True); DATA.mkdir(parents=True, exist_ok=True)
+        raise FileNotFoundError(
+            f"CloudflareSpeedTest binary not found: {CFST_BIN}"
+        )
+
+    OUT.mkdir(parents=True, exist_ok=True)
+    DATA.mkdir(parents=True, exist_ok=True)
     state = load_state()
     if not should_scan(state):
         set_output("publish", False)
         return
+
     round_no = int(state.get("roundNo", 0))
     errors = []
     any_updated = False
-    print(f"Official CloudflareSpeedTest scan round {round_no + 1}: {', '.join(REGIONS)}")
+    print(
+        f"Official CloudflareSpeedTest HTTPS scan round {round_no + 1}: "
+        f"{', '.join(REGIONS)}"
+    )
+
     for region in REGIONS:
         url = SOURCE_URL + region
         print(f"\n===== {region} =====\nSource: {url}")
         try:
             payload, source_bytes = fetch_payload(url)
             candidates = candidates_from(payload)
-            print(f"{region}: parsed {len(candidates)} unique IPv4:port candidates; scanning every candidate.")
+            print(
+                f"{region}: parsed {len(candidates)} unique IPv4:port "
+                "candidates; scanning every candidate."
+            )
             latencies = scan_region(candidates)
-            updated = write_region(region, candidates, latencies, source_bytes)
+            updated = write_region(
+                region, candidates, latencies, source_bytes
+            )
             any_updated = any_updated or updated
             if not updated:
-                errors.append(f"{region}: no successful CFST result; old files retained")
+                errors.append(
+                    f"{region}: no successful HTTPS result; old files retained"
+                )
         except Exception as exc:
             message = f"{region}: {type(exc).__name__}: {exc}"
             errors.append(message)
-            print(f"ERROR: {message}; keeping previous region files.", file=sys.stderr)
+            print(
+                f"ERROR: {message}; keeping previous region files.",
+                file=sys.stderr,
+            )
+
     build_index()
     completed = iso_now()
-    STATE_FILE.write_text(json.dumps({"lastCompletedAt": completed, "roundNo": round_no + 1, "regions": REGIONS, "lastErrors": errors}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    STATE_FILE.write_text(
+        json.dumps(
+            {
+                "lastCompletedAt": completed,
+                "roundNo": round_no + 1,
+                "regions": REGIONS,
+                "lastErrors": errors,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
     set_output("publish", True)
     print(f"Round completed at {completed}; any_region_updated={any_updated}")
     if errors:
-        print("Regions needing attention:\n" + "\n".join(f" - {e}" for e in errors))
+        print(
+            "Regions needing attention:\n"
+            + "\n".join(f" - {error}" for error in errors)
+        )
 
 
 if __name__ == "__main__":
