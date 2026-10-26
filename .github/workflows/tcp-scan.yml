@@ -1,10 +1,9 @@
-
-name: Global YouTube HTTPS latency scan (official CloudflareSpeedTest)
+name: Cloudflare edge IP latency ranking
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "*/30 * * * *"
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,127 +15,34 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-
+    timeout-minutes: 45
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Download official CloudflareSpeedTest Linux x86-64 release
+      - name: Download CloudflareSpeedTest
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import json
-          import urllib.request
-
-          req = urllib.request.Request(
-              "https://api.github.com/repos/XIU2/CloudflareSpeedTest/releases/latest",
-              headers={"User-Agent": "global-tcp-scan"},
-          )
-          with urllib.request.urlopen(req, timeout=30) as response:
-              release = json.load(response)
-
-          assets = release.get("assets", [])
-          matches = [
-              asset for asset in assets
-              if "linux" in asset["name"].lower()
-              and (
-                  "amd64" in asset["name"].lower()
-                  or "x86_64" in asset["name"].lower()
-              )
-              and asset["name"].lower().endswith(
-                  (".tar.gz", ".tgz", ".zip")
-              )
-          ]
-          if not matches:
-              raise SystemExit(
-                  "No Linux x86-64 archive found. Assets: "
-                  + ", ".join(asset["name"] for asset in assets)
-              )
-          print(matches[0]["browser_download_url"])
-          PY
-          url="$(python - <<'PY'
-          import json
-          import urllib.request
-
-          req = urllib.request.Request(
-              "https://api.github.com/repos/XIU2/CloudflareSpeedTest/releases/latest",
-              headers={"User-Agent": "global-tcp-scan"},
-          )
-          with urllib.request.urlopen(req, timeout=30) as response:
-              release = json.load(response)
-
-          assets = release.get("assets", [])
-          matches = [
-              asset for asset in assets
-              if "linux" in asset["name"].lower()
-              and (
-                  "amd64" in asset["name"].lower()
-                  or "x86_64" in asset["name"].lower()
-              )
-              and asset["name"].lower().endswith(
-                  (".tar.gz", ".tgz", ".zip")
-              )
-          ]
-          if not matches:
-              raise SystemExit("No Linux x86-64 release archive found")
-          print(matches[0]["browser_download_url"])
-          PY
-          )"
-          echo "Downloading $url"
-          curl --fail --location --retry 3 "$url" -o /tmp/cfst-release
-          mkdir -p /tmp/cfst-unpack
-          if file /tmp/cfst-release | grep -qi 'gzip compressed'; then
-            tar -xzf /tmp/cfst-release -C /tmp/cfst-unpack
-          elif file /tmp/cfst-release | grep -qi 'Zip archive'; then
-            unzip -q /tmp/cfst-release -d /tmp/cfst-unpack
-          else
-            echo "Unknown CFST archive format"
-            file /tmp/cfst-release
-            exit 1
-          fi
-          binary="$(find /tmp/cfst-unpack -type f \( -name cfst -o -name CloudflareSpeedTest \) -print -quit)"
-          test -n "$binary" || {
-            echo "Could not find CFST executable"
-            find /tmp/cfst-unpack -maxdepth 3 -type f
-            exit 1
-          }
-          install -m 0755 "$binary" ./cfst
-          ./cfst -v || true
-
-      - name: Run all-region HTTPS scan
-        id: scan
-        env:
-          SOURCE_URL: https://proxy.seeck.cn/api/nodes?region=
-          REGIONS: JP,HK,KR,CN,US,SG,DE
-          TOP_N: "20"
-          PUBLISH_STANDARD_VARIANTS: "true"
-          CFST_BIN: ./cfst
-          CFST_THREADS: "20"
-          CFST_ROUNDS: "4"
-          CFST_TIMEOUT_SECONDS: "3"
-          CFST_URL: https://www.youtube.com/generate_204
-          CFST_HTTPING_CODE: "204"
+          curl -fL --retry 3 https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.5/cfst_linux_amd64.tar.gz -o /tmp/cfst.tar.gz
+          tar -xzf /tmp/cfst.tar.gz -C "$GITHUB_WORKSPACE"
+          chmod +x "$GITHUB_WORKSPACE/cfst"
+          "$GITHUB_WORKSPACE/cfst" -v
+      - name: Scan all regions
         run: python scanner.py
-
-      - name: Commit updated public results and state
-        if: steps.scan.outputs.publish == 'true'
+      - name: Commit only seven region files
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add public .scan-state.json
+          git add public/jp.txt public/hk.txt public/kr.txt public/cn.txt public/us.txt public/sg.txt public/de.txt
           if git diff --cached --quiet; then
-            echo "No published file changes."
+            echo "No output changes to commit."
           else
-            git commit -m "Update YouTube HTTPS latency regional rankings"
+            git commit -m "Update regional Cloudflare latency rankings"
             git push
           fi
