@@ -34,7 +34,8 @@ def scan(region,endpoints):
         ipfile=ROOT/f".ips-{region.lower()}-{port}.txt"
         csvfile=ROOT/f".result-{region.lower()}-{port}.csv"
         try:
-            ipfile.write_text("\n".join(sorted(ips,key=lambda s:tuple(map(int,s.split("."))))+"\n",encoding="utf-8")
+            sorted_ips = sorted(ips, key=lambda s: tuple(map(int, s.split("."))))
+            ipfile.write_text("\n".join(sorted_ips) + "\n", encoding="utf-8")
             csvfile.unlink(missing_ok=True)
             cmd=[str(CFST),"-f",str(ipfile),"-tp",str(port),"-n","100","-t","3","-tl","9999","-tlr","1","-p","0","-o",str(csvfile),"-dd"]
             print(f"[{region}] port {port}: {len(ips)} IPs")
