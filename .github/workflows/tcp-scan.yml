@@ -1,5 +1,40 @@
 ```yaml
-      - name: Download CloudflareSpeedTest
+name: TCP Scan
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tcp-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          fi
+
+      - name: Download and locate CloudflareSpeedTest
         shell: bash
         run: |
           set -euo pipefail
@@ -9,31 +44,59 @@
           EXTRACT_DIR="/tmp/cfst-extract"
 
           mkdir -p "$EXTRACT_DIR"
+          curl -fL --retry 3 --connect-timeout 20 "$URL" -o "$ARCHIVE"
 
-          curl -fL --retry 3 "$URL" -o "$ARCHIVE"
-
-          echo "=== Archive contents ==="
+          echo "===== Archive contents ====="
           tar -tzf "$ARCHIVE"
 
           tar -xzf "$ARCHIVE" -C "$EXTRACT_DIR"
 
-          echo "=== Extracted files ==="
-          find "$EXTRACT_DIR" -maxdepth 3 -type f -print
+          echo "===== Extracted files ====="
+          find "$EXTRACT_DIR" -maxdepth 4 -type f -print
 
-          # 自动查找解压出来的 Linux 可执行程序
-          BIN="$(find "$EXTRACT_DIR" -maxdepth 3 -type f \
+          BIN="$(find "$EXTRACT_DIR" -type f \
             \( -name 'cfst' -o -name 'CloudflareST' -o -name 'CloudflareSpeedTest' \) \
             -print -quit)"
 
           if [ -z "$BIN" ]; then
-            echo "::error::找不到 CloudflareSpeedTest 可执行文件，请检查上面的压缩包内容。"
+            echo "::error::未在压缩包中找到可执行文件。请检查上面的 Archive contents 和 Extracted files。"
             exit 1
           fi
 
-          chmod +x "$BIN"
-          cp "$BIN" "$GITHUB_WORKSPACE/cfst"
-          chmod +x "$GITHUB_WORKSPACE/cfst"
+          install -m 755 "$BIN" "$GITHUB_WORKSPACE/cfst"
 
-          echo "=== Verify executable ==="
-          "$GITHUB_WORKSPACE/cfst" -v
+          echo "===== Verify binary ====="
+          file "$GITHUB_WORKSPACE/cfst"
+          "$GITHUB_WORKSPACE/cfst" -v || true
+
+      - name: Run regional scans
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scanner.py
+
+      - name: Commit regional results
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- \
+            public/jp.txt \
+            public/hk.txt \
+            public/kr.txt \
+            public/cn.txt \
+            public/us.txt \
+            public/sg.txt \
+            public/de.txt
+
+          if git diff --cached --quiet; then
+            echo "没有文件变化，无需提交。"
+            exit 0
+          fi
+
+          git commit -m "Update regional TCP scan results"
+          git push
 ```
