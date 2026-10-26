@@ -34,7 +34,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 PUBLIC = ROOT / "public"
 LOG_DIR = ROOT / "logs"
-DATA_DIR = PUBLIC / "data"
+DATA_DIR = ROOT / "scan_data"
 WORK_DIR = ROOT / "work_cfst"
 
 REGIONS = ("JP", "HK", "KR", "CN", "US", "SG", "DE")
@@ -325,7 +325,7 @@ def resolve_cfst_executable():
 
     raise FileNotFoundError(
         "Official CloudflareSpeedTest executable not found. "
-        "Put CloudflareST.exe or cfst.exe beside scanner.py, "
+        "Put the Linux CFST executable beside scanner.py, "
         "or configure CFST_EXECUTABLE at the top of this file."
     )
 
